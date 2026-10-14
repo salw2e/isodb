@@ -436,6 +436,38 @@ func (p *pager) walk(id pageID, fn func(k, v []byte) bool) (bool, error) {
 	return true, nil
 }
 
+// seek calls fn for every key from k on, in order, until it returns false.
+func (p *pager) seek(root pageID, k []byte, fn func(k, v []byte) bool) error {
+	if root == 0 {
+		return nil
+	}
+	_, err := p.seekIn(root, k, fn)
+	return err
+}
+
+func (p *pager) seekIn(id pageID, k []byte, fn func(k, v []byte) bool) (bool, error) {
+	n, err := p.load(id)
+	if err != nil {
+		return false, err
+	}
+	if n.leaf {
+		keys, vals := n.keys, n.vals
+		for i := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], k) >= 0 }); i < len(keys); i++ {
+			if !fn(keys[i], vals[i]) {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	kids := append([]pageID(nil), n.kids...)
+	for i := search(n, k); i < len(kids); i++ {
+		if ok, err := p.seekIn(kids[i], k, fn); err != nil || !ok {
+			return ok, err
+		}
+	}
+	return true, nil
+}
+
 type piece struct {
 	sep []byte
 	id  pageID
