@@ -35,9 +35,18 @@ func (s *Session) tableCols(tb *Table, alias string) []colInfo {
 	return cols
 }
 
-// visibleRows scans a table under the current transaction.
-func (s *Session) visibleRows(tb *Table) ([][]Value, []*Row, error) {
+// visibleRows scans a table under the current transaction, decoding the columns need marks (all
+// when nil). Without withRefs it leaves out the rows themselves.
+func (s *Session) visibleRows(tb *Table, need []bool, withRefs bool) ([][]Value, []*Row, error) {
 	db := s.db
+	if !withRefs {
+		var rows [][]Value
+		err := db.visible(s.tx, tb, false, need, func(vals []Value, _ *Row) error {
+			rows = append(rows, vals)
+			return nil
+		})
+		return rows, nil, err
+	}
 	db.scan(s.tx, tb)
 	var rows [][]Value
 	var refs []*Row
@@ -469,6 +478,22 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 	}
 
+	// the columns each table has to be decoded in
+	var conds []sql.Expr // WHERE, inner joins' ON, and outer joins' ON
+	for _, cj := range conjs {
+		conds = append(conds, cj.x)
+	}
+	for _, src := range srcs {
+		conds = append(conds, src.on)
+	}
+	need := neededCols(sel, order, l, conds...)
+	srcNeed := func(i int) []bool {
+		if need == nil {
+			return nil
+		}
+		return need[starts[i] : starts[i]+len(srcs[i].cols)]
+	}
+
 	// one table without a key lookup is read straight from storage, row by row
 	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && srcs[0].ix == nil && !sel.ForUpdate
 	var streamConds []sql.Expr
@@ -550,7 +575,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 						return nil, err
 					}
 				}
-			} else if src.rows, src.refs, err = s.visibleRows(src.table); err != nil {
+			} else if src.rows, src.refs, err = s.visibleRows(src.table, srcNeed(i), sel.ForUpdate); err != nil {
 				return nil, err
 			}
 		}
@@ -728,7 +753,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				}
 				rng = nil // read it all instead; the rows come in no particular order
 			}
-			return s.db.visible(s.tx, src.table, true, neededCols(sel, order, l), visit)
+			return s.db.visible(s.tx, src.table, true, need, visit)
 		}
 		j := joinOrder[p]
 		src := srcs[j]
@@ -819,7 +844,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 }
 
 // neededCols marks the columns a query reads, or returns nil when it may read any of them.
-func neededCols(sel *sql.Select, order []sql.Order, l *layout) []bool {
+func neededCols(sel *sql.Select, order []sql.Order, l *layout, extra ...sql.Expr) []bool {
 	need := make([]bool, len(l.cols))
 	all := false
 	mark := func(x sql.Expr) {
@@ -840,7 +865,7 @@ func neededCols(sel *sql.Select, order []sql.Order, l *layout) []bool {
 		}
 		mark(it.Expr)
 	}
-	for _, x := range append([]sql.Expr{sel.Where, sel.Having}, sel.GroupBy...) {
+	for _, x := range append(append([]sql.Expr{sel.Where, sel.Having}, sel.GroupBy...), extra...) {
 		mark(x)
 	}
 	for _, o := range order {
