@@ -32,7 +32,7 @@ type Table struct {
 	Name    string
 	Cols    []Column
 	PK      []int
-	Uniques [][]int
+	indexes []*Index
 	rows    map[string]*Row
 	order   []*Row
 	nextID  int64
@@ -48,6 +48,7 @@ type Row struct {
 	readers   map[*Txn]bool
 	disk      *Version // the version the page file holds
 	transient bool     // met during a scan of the page file, not kept in memory
+	ix        []ixKey  // where mem indexes list this row
 }
 
 type Version struct {
@@ -96,6 +97,7 @@ type DB struct {
 	waiting  int
 	ddl      []string
 	recovering bool
+	opening    bool // loading the schema of the page file: index trees come from its catalog
 }
 
 func (t *Txn) visible(v *Version) bool {
@@ -244,6 +246,7 @@ func (db *DB) write(t *Txn, tb *Table, r *Row, vals []Value, dead bool) {
 	} else {
 		r.vers = append(r.vers, &Version{tx: t, vals: vals, dead: dead})
 	}
+	db.reindex(r)
 	if !t.written[r] {
 		if t.written == nil {
 			t.written = map[*Row]bool{}
@@ -336,6 +339,7 @@ func (db *DB) abortTx(t *Txn) {
 		if n := len(r.vers); n > 0 && r.vers[n-1].tx == t {
 			r.vers = r.vers[:n-1]
 		}
+		db.reindex(r)
 	}
 	db.release(t)
 	for _, r := range t.writes {
@@ -394,5 +398,6 @@ func (db *DB) cleanup(t *Txn) {
 		if db.pg == nil && len(r.vers) == 1 && r.vers[0].dead && r.vers[0].tx.state == committed && r.vers[0].tx.commit <= h && len(r.readers) == 0 {
 			r.vers = nil
 		}
+		db.reindex(r)
 	}
 }

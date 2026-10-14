@@ -23,6 +23,8 @@ type source struct {
 	on    sql.Expr
 	pk    sql.Expr // equality on the primary key column: fetch by key instead of scanning
 	pkCol int
+	ix    *Index     // otherwise equalities on every column of an index
+	ixEq  []sql.Expr
 }
 
 func (s *Session) tableCols(tb *Table, alias string) []colInfo {
@@ -377,36 +379,41 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		conjs = append(conjs, cj)
 	}
 
-	// primary key equal to a value that needs no other table: fetch that row instead of scanning
+	// primary key or index columns equal to values that need no other table: look rows up instead
+	// of scanning
 	for _, src := range srcs {
-		if src.table == nil || len(src.table.PK) != 1 || hasLeft {
+		if src.table == nil || hasLeft {
 			continue
 		}
-		pkName := src.table.Cols[src.table.PK[0]].Name
-		for _, cj := range conjs {
-			b, ok := cj.x.(*sql.Binary)
-			if cj.final || !ok || b.Op != "=" {
-				continue
-			}
-			for _, side := range [][2]sql.Expr{{b.L, b.R}, {b.R, b.L}} {
-				col, ok := side[0].(*sql.Col)
-				if !ok || col.Name != pkName || col.Table != "" && col.Table != src.cols[0].table || col.Table == "" && len(l.byName[col.Name]) > 1 {
+		eq := func(name string) sql.Expr {
+			for _, cj := range conjs {
+				b, ok := cj.x.(*sql.Binary)
+				if cj.final || !ok || b.Op != "=" {
 					continue
 				}
-				if refs, _ := refsOf(side[1], l, starts); len(refs) > 0 || hasSubquery(side[1]) {
-					continue
+				for _, side := range [][2]sql.Expr{{b.L, b.R}, {b.R, b.L}} {
+					col, ok := side[0].(*sql.Col)
+					if !ok || col.Name != name || col.Table != "" && col.Table != src.cols[0].table || col.Table == "" && len(l.byName[col.Name]) > 1 {
+						continue
+					}
+					if refs, _ := refsOf(side[1], l, starts); len(refs) > 0 || hasSubquery(side[1]) {
+						continue
+					}
+					return side[1]
 				}
-				src.pk, src.pkCol = side[1], src.table.PK[0]
-				break
 			}
-			if src.pk != nil {
-				break
-			}
+			return nil
+		}
+		if len(src.table.PK) == 1 {
+			src.pk, src.pkCol = eq(src.table.Cols[src.table.PK[0]].Name), src.table.PK[0]
+		}
+		if src.pk == nil {
+			src.ix, src.ixEq = pickIndex(src.table, eq)
 		}
 	}
 
 	// one table without a key lookup is read straight from storage, row by row
-	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && !sel.ForUpdate
+	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && srcs[0].ix == nil && !sel.ForUpdate
 	var streamConds []sql.Expr
 
 	// load each table and filter it by the conditions that read only that table
@@ -428,6 +435,17 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 					}
 					if vals != nil {
 						src.rows, src.refs = [][]Value{vals}, []*Row{r}
+					}
+				}
+			} else if src.ix != nil {
+				e.row = cur
+				k, ok, err := lookupKey(src.table, src.ix, src.ixEq, e)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					if src.rows, src.refs, err = s.indexed(src.table, src.ix, k); err != nil {
+						return nil, err
 					}
 				}
 			} else if src.rows, src.refs, err = s.visibleRows(src.table); err != nil {
