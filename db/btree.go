@@ -452,7 +452,7 @@ func (p *pager) joinRoot(parts []piece) pageID {
 		r.keys = append(r.keys, x.sep)
 		r.kids = append(r.kids, x.id)
 	}
-	return p.splitIfFull(r)[0].id
+	return p.splitIfFull(r, false)[0].id
 }
 
 func (p *pager) putIn(id pageID, k, v []byte) ([]piece, error) {
@@ -476,12 +476,12 @@ func (p *pager) putIn(id pageID, k, v []byte) ([]piece, error) {
 				}
 			}
 			n.vals[i], n.ovf[i] = v, o
-		} else {
-			n.keys = insertAt(n.keys, i, append([]byte(nil), k...))
-			n.vals = insertAt(n.vals, i, v)
-			n.ovf = insertAt(n.ovf, i, o)
+			return p.splitIfFull(n, false), nil
 		}
-		return p.splitIfFull(n), nil
+		n.keys = insertAt(n.keys, i, append([]byte(nil), k...))
+		n.vals = insertAt(n.vals, i, v)
+		n.ovf = insertAt(n.ovf, i, o)
+		return p.splitIfFull(n, i == len(n.keys)-1), nil
 	}
 	ci := search(n, k)
 	parts, err := p.putIn(n.kids[ci], k, v)
@@ -489,7 +489,7 @@ func (p *pager) putIn(id pageID, k, v []byte) ([]piece, error) {
 		return nil, err
 	}
 	p.replaceKid(n, ci, parts)
-	return p.splitIfFull(n), nil
+	return p.splitIfFull(n, ci == len(n.kids)-len(parts) && len(parts) > 1), nil
 }
 
 func (p *pager) replaceKid(n *node, ci int, parts []piece) {
@@ -511,8 +511,10 @@ func insertAt[T any](s []T, i int, v T) []T {
 	return s
 }
 
-// splitIfFull splits a node that no longer fits a page into pieces that do.
-func (p *pager) splitIfFull(n *node) []piece {
+// splitIfFull splits a node that no longer fits a page into pieces that do. When the overflow came
+// from appending at the end (keys inserted in order), the old page stays full and only the last
+// entry moves to the new one, so a table filled in key order packs its pages instead of half-filling them.
+func (p *pager) splitIfFull(n *node, tail bool) []piece {
 	if size(n) <= pageSize {
 		return []piece{{nil, n.id}}
 	}
@@ -521,6 +523,9 @@ func (p *pager) splitIfFull(n *node) []piece {
 	for at < len(n.keys)-1 && acc < half {
 		acc += entrySize(n, at)
 		at++
+	}
+	if tail && len(n.keys) > 1 {
+		at = len(n.keys) - 1
 	}
 	if at == 0 {
 		at = 1
@@ -539,8 +544,8 @@ func (p *pager) splitIfFull(n *node) []piece {
 		r.kids = append(r.kids, n.kids[at+1:]...)
 		n.keys, n.kids = n.keys[:at:at], n.kids[:at+1:at+1]
 	}
-	out := p.splitIfFull(n)
-	rest := p.splitIfFull(r)
+	out := p.splitIfFull(n, false)
+	rest := p.splitIfFull(r, false)
 	rest[0].sep = sep
 	return append(out, rest...)
 }
@@ -637,13 +642,20 @@ func (p *pager) commit(ts uint64, catalog pageID) error {
 	if err != nil {
 		return err
 	}
-	next := append(append(append([]pageID(nil), p.free...), p.freed...), listIDs...)
+	// the list itself goes on pages that are free now; pages the previous checkpoint still uses
+	// (freed and the old list) must not be overwritten before the new meta page is written
+	total := len(p.free) + len(p.freed) + len(listIDs)
+	need := (total*8)/(pageSize-10) + 1
+	if need > len(p.free) {
+		need = len(p.free)
+	}
+	reserved := p.free[len(p.free)-need:]
+	next := append(append(append([]pageID(nil), p.free[:len(p.free)-need]...), p.freed...), listIDs...)
 	var lb []byte
 	for _, id := range next {
 		lb = binary.LittleEndian.AppendUint64(lb, uint64(id))
 	}
-	// the list itself goes on pages at the end of the file, which nothing else uses
-	p.free = nil
+	p.free = append([]pageID(nil), reserved...)
 	head := pageID(0)
 	if len(lb) > 0 {
 		var err error
@@ -668,7 +680,7 @@ func (p *pager) commit(ts uint64, catalog pageID) error {
 		return err
 	}
 	p.m = m
-	p.free = next
+	p.free = append(next, p.free...) // reserved pages the list did not need
 	p.freed = nil
 	for id, n := range p.dirty {
 		n.dirty = false

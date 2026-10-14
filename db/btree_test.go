@@ -139,3 +139,25 @@ func TestFreedPagesAreReused(t *testing.T) {
 		t.Fatalf("file keeps growing: %d pages after 10 rounds, %d after 40", sizes[10], sizes[len(sizes)-1])
 	}
 }
+
+func TestInOrderInsertsFillPages(t *testing.T) {
+	p, _ := openPager(filepath.Join(t.TempDir(), "pages"), 64)
+	var root pageID
+	var err error
+	for i := 0; i < 50000; i++ {
+		k := []byte(key([]Value{int64(i)}))
+		if root, err = p.put(root, k, make([]byte, 50)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.commit(0, root)
+	// 50,000 entries of about 64 bytes need about 800 full pages
+	if p.m.pages > 1000 {
+		t.Fatalf("%d pages for keys inserted in order, pages are not being filled", p.m.pages)
+	}
+	want := map[string][]byte{}
+	for i := 0; i < 50000; i++ {
+		want[key([]Value{int64(i)})] = make([]byte, 50)
+	}
+	check(t, p, root, want)
+}
