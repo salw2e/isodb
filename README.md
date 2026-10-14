@@ -65,6 +65,8 @@ Measured on a 2-core VPS, with Postgres 17 (default settings) on the same disk a
 | `count(*)` and sums over 5,000,000 rows, cold cache | 15 s | |
 | Lookup by primary key in that table | 2 ms | |
 | Lookup by primary key while another client scans 400,000 rows | 0.2 ms | |
+| Lookup by an indexed column, 200,000 rows | 0.25 ms (206 ms without the index) | |
+| Loading 20,000 rows into a table with a `UNIQUE` column | 0.3 s (63 s before unique checks used an index) | |
 
 isodb reads faster because it does much less per query: no planner, no permission checks, no system catalogs. Commits went from 416 to 1,238 per second once the log was zero-filled ahead and synced with `fdatasync`, the way Postgres does it; a sync on this disk takes 11.5 ms when the file grows and 4 ms when it does not.
 
@@ -74,13 +76,14 @@ isodb reads faster because it does much less per query: no planner, no permissio
 - **Recent changes**: rows written since the last checkpoint stay in memory with all their versions, on top of the B+trees. A checkpoint folds them into the page file and drops the ones every running transaction can already see.
 - **Log**: every commit is a checksummed record in a write-ahead log. Commits are queued and a background writer syncs them in batches (group commit). The log file is zero-filled a megabyte ahead so a sync only has to flush data, not a new file size; a commit returns once its record is on disk and becomes visible once every earlier commit has. Recovery opens the last checkpoint, replays the log and cuts off a torn last record.
 - **Isolation**: READ COMMITTED (the default, as in Postgres), REPEATABLE READ (snapshot isolation, first updater wins) and SERIALIZABLE (serializable snapshot isolation after [Cahill et al.](https://dl.acm.org/doi/10.1145/1620585.1620587): reads leave non-blocking markers, read-write dependencies between concurrent transactions are tracked, and a transaction that would get both an incoming and an outgoing dependency is aborted).
-- **Queries**: a hand-written parser and executor. A query on one table reads it row by row and aggregates with running totals, so its memory grows with the result, not the table. Joins are ordered by size and use hash joins and primary key lookups. Constant NULL conditions are folded the way Postgres folds them.
+- **Indexes**: one B+tree per index in the page file, keyed by the indexed values followed by the primary key, and updated by each checkpoint. Rows changed since then are found through a map in memory that lists every version they hold. A lookup reads both and rechecks each row against the transaction's snapshot, so an index never needs versions of its own.
+- **Queries**: a hand-written parser and executor. A query on one table reads it row by row and aggregates with running totals, so its memory grows with the result, not the table. A table filtered by `=` on its primary key, or on every column of an index, is read through it instead of scanned. Joins are ordered by size and use hash joins. Constant NULL conditions are folded the way Postgres folds them.
 
 ## Limits
 
 - Plain reads at READ COMMITTED and REPEATABLE READ run in parallel. Writes, `SELECT ... FOR UPDATE` and anything under SERIALIZABLE run one at a time behind a global lock; transactions interleave between statements.
 - A query that joins tables reads all of them into memory; only single-table queries stream.
-- Only primary keys are indexed. `CREATE INDEX` is accepted and enforces `UNIQUE`, but queries scan.
+- Indexes are only used for `=` on every column of the index; ranges, `ORDER BY` and join conditions still scan. `CREATE INDEX` keeps the new index in memory until the next checkpoint.
 - A checkpoint pauses other statements while it writes. The page file never shrinks.
 - Types are integer, double, text and boolean. `numeric` is stored as a double, dates as text.
 - SERIALIZABLE aborts more often than Postgres, because the pivot rule is the conservative one.
