@@ -40,8 +40,9 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		ln.Close()
+		err := d.Close()
 		pprof.StopCPUProfile()
-		if err := d.Close(); err != nil {
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "isodb:", err)
 			os.Exit(1)
 		}
