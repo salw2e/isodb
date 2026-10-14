@@ -40,9 +40,16 @@ func (s *Session) tableCols(tb *Table, alias string) []colInfo {
 func (s *Session) visibleRows(tb *Table, need []bool, withRefs bool) ([][]Value, []*Row, error) {
 	db := s.db
 	if !withRefs {
+		// rows are copied into large chunks, so a join reading them in any order stays in cache
 		var rows [][]Value
-		err := db.visible(s.tx, tb, false, need, func(vals []Value, _ *Row) error {
-			rows = append(rows, vals)
+		var chunk []Value
+		err := db.visible(s.tx, tb, true, need, func(vals []Value, r *Row) error {
+			if len(chunk)+len(vals) > cap(chunk) {
+				chunk = make([]Value, 0, max(4096, len(vals)))
+			}
+			at := len(chunk)
+			chunk = append(chunk, vals...)
+			rows = append(rows, chunk[at:len(chunk):len(chunk)])
 			return nil
 		})
 		return rows, nil, err
@@ -511,6 +518,34 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	// load each table and filter it by the conditions that read only that table; a table that can
 	// be probed is left unloaded when the rows driving it are few next to its size
 	loaded := make([]bool, n)
+	// in a join, tables that need a full scan wait until the lookups are decided; the biggest is
+	// then read row by row as the outer table and only the others are loaded
+	pending := make([]bool, n)
+	pendConds := make([][]sql.Expr, n)
+	filter := func(i int, mine []sql.Expr) error {
+		src := srcs[i]
+		width := len(src.cols)
+		var rows [][]Value
+		var refs []*Row
+		for ri, r := range src.rows {
+			copy(cur[starts[i]:starts[i]+width], r)
+			ok, err := test(mine)
+			if err != nil {
+				return err
+			}
+			if ok {
+				rows = append(rows, r)
+				if src.refs != nil {
+					refs = append(refs, src.refs[ri])
+				}
+			}
+		}
+		src.rows = rows
+		if src.refs != nil {
+			src.refs = refs
+		}
+		return nil
+	}
 	loadOrder := make([]int, 0, n)
 	for i := range srcs {
 		if probes[i] == nil {
@@ -531,7 +566,11 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 					drive = -1
 					break
 				}
-				drive *= max(len(srcs[d].rows), 1)
+				size := len(srcs[d].rows)
+				if pending[d] {
+					size = s.db.estimate(srcs[d].table)
+				}
+				drive *= max(size, 1)
 			}
 			pr.lazy = drive >= 0 && drive*20 <= s.db.estimate(src.table)
 		}
@@ -575,6 +614,8 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 						return nil, err
 					}
 				}
+			} else if n > 1 && !hasLeft && !sel.ForUpdate {
+				pending[i] = true
 			} else if src.rows, src.refs, err = s.visibleRows(src.table, srcNeed(i), sel.ForUpdate); err != nil {
 				return nil, err
 			}
@@ -590,28 +631,33 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 			streamConds = mine
 			continue
 		}
-		if len(mine) == 0 {
+		if pending[i] {
+			pendConds[i] = mine
 			continue
 		}
-		width := len(src.cols)
-		var rows [][]Value
-		var refs []*Row
-		for ri, r := range src.rows {
-			copy(cur[starts[i]:starts[i]+width], r)
-			ok, err := test(mine)
-			if err != nil {
+		if len(mine) > 0 {
+			if err := filter(i, mine); err != nil {
 				return nil, err
 			}
-			if ok {
-				rows = append(rows, r)
-				if src.refs != nil {
-					refs = append(refs, src.refs[ri])
-				}
-			}
 		}
-		src.rows = rows
-		if src.refs != nil {
-			src.refs = refs
+	}
+	driver := -1
+	for i := range srcs {
+		if pending[i] && (driver < 0 || s.db.estimate(srcs[i].table) > s.db.estimate(srcs[driver].table)) {
+			driver = i
+		}
+	}
+	for i, src := range srcs {
+		if !pending[i] || i == driver {
+			continue
+		}
+		if src.rows, src.refs, err = s.visibleRows(src.table, srcNeed(i), false); err != nil {
+			return nil, err
+		}
+		if len(pendConds[i]) > 0 {
+			if err := filter(i, pendConds[i]); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -625,7 +671,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 			if bound[i] {
 				continue
 			}
-			if hasLeft {
+			if hasLeft || i == driver && len(joinOrder) == 0 {
 				best = i
 				break
 			}
@@ -663,6 +709,19 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		bound[best] = true
 		joinOrder = append(joinOrder, best)
 	}
+	// with an equality between the first two tables the second is hashed, so make it the smaller
+	if n > 1 && !hasLeft && driver < 0 {
+		a, b := joinOrder[0], joinOrder[1]
+		if (probes[b] == nil || !probes[b].lazy) && len(srcs[a].rows) < len(srcs[b].rows) {
+			for _, cj := range conjs {
+				if x, ok := cj.x.(*sql.Binary); ok && x.Op == "=" && !cj.final && !cj.done && len(cj.refs) == 2 && cj.refs[a] && cj.refs[b] {
+					joinOrder[0], joinOrder[1] = b, a
+					pos[a], pos[b] = 1, 0
+					break
+				}
+			}
+		}
+	}
 	levels := make([][]sql.Expr, n+1)
 	for _, cj := range conjs {
 		if cj.done {
@@ -682,7 +741,8 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	// hash join: an equality between this table and tables already joined
 	type hashJoin struct {
 		probe sql.Expr
-		index map[string][]int
+		index *valueMap // value -> its first row
+		next  []int     // the next row with the same value, or -1
 	}
 	hashes := make([]*hashJoin, n)
 	for p := 1; p < n && !hasLeft; p++ {
@@ -690,7 +750,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		if probes[j] != nil && probes[j].lazy {
 			continue
 		}
-		for _, c := range levels[p] {
+		for ci, c := range levels[p] {
 			b, ok := c.(*sql.Binary)
 			if !ok || b.Op != "=" {
 				continue
@@ -703,20 +763,26 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				}
 				src := srcs[j]
 				width := len(src.cols)
-				hj := &hashJoin{probe: side[1], index: map[string][]int{}}
-				for ri, r := range src.rows {
+				hj := &hashJoin{probe: side[1], index: newValueMap(), next: make([]int, len(src.rows))}
+				for ri := len(src.rows) - 1; ri >= 0; ri-- {
+					r := src.rows[ri]
 					copy(cur[starts[j]:starts[j]+width], r)
 					e.row = cur
 					v, err := e.eval(side[0])
 					if err != nil {
 						return nil, err
 					}
+					hj.next[ri] = -1
 					if v != nil {
-						k := key([]Value{v})
-						hj.index[k] = append(hj.index[k], ri)
+						if first, ok := hj.index.get(v); ok {
+							hj.next[ri] = first
+						}
+						hj.index.put(v, ri)
 					}
 				}
 				hashes[p] = hj
+				// a value found through the hash already equals the probe the way = compares
+				levels[p] = append(levels[p][:ci:ci], levels[p][ci+1:]...)
 				break
 			}
 			if hashes[p] != nil {
@@ -727,6 +793,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 
 	var sink func([]Value) error
 	var loop func(p int) error
+	candBuf := make([][]int, n+1) // hash matches per join level, reused
 	loop = func(p int) error {
 		if p == n {
 			ok, err := test(levels[n])
@@ -734,6 +801,20 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				return err
 			}
 			return sink(cur)
+		}
+		if p == 0 && driver >= 0 {
+			src := srcs[driver]
+			width := len(src.cols)
+			conds := append(append([]sql.Expr(nil), pendConds[driver]...), levels[0]...)
+			curRefs[driver] = nil
+			return s.db.visible(s.tx, src.table, true, srcNeed(driver), func(vals []Value, _ *Row) error {
+				copy(cur[starts[driver]:starts[driver]+width], vals)
+				ok, err := test(conds)
+				if err != nil || !ok {
+					return err
+				}
+				return loop(1)
+			})
 		}
 		if p == 0 && stream {
 			src := srcs[0]
@@ -779,7 +860,13 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				return err
 			}
 			if v != nil {
-				cand = hj.index[key([]Value{v})]
+				if ri, ok := hj.index.get(v); ok {
+					cand = candBuf[p][:0]
+					for ; ri >= 0; ri = hj.next[ri] {
+						cand = append(cand, ri)
+					}
+					candBuf[p] = cand
+				}
 			}
 		} else {
 			cand = make([]int, len(src.rows))
@@ -992,32 +1079,47 @@ func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value)
 			first []Value
 			accs  []*acc
 		}
-		var keys []string
-		groups := map[string]*group{}
+		var glist []*group
+		groups := map[string]int{}
+		one := newValueMap() // a single GROUP BY value needs no key string
 		e := &env{l: l, outer: outer, s: s, params: s.params}
+		var gexprs []sql.Expr
+		for _, g := range sel.GroupBy {
+			if pos := outputPos(g, res.cols); pos >= 0 {
+				// GROUP BY prefers an input column over an output alias of the same name
+				if c, ok := g.(*sql.Col); !ok || len(l.byName[c.Name]) == 0 {
+					g = items[pos].Expr
+				}
+			}
+			gexprs = append(gexprs, g)
+		}
+		kv := make([]Value, len(gexprs))
 		err := produce(func(r []Value) error {
 			e.row = r
-			var kv []Value
-			for _, g := range sel.GroupBy {
-				if pos := outputPos(g, res.cols); pos >= 0 {
-					// GROUP BY prefers an input column over an output alias of the same name
-					if c, ok := g.(*sql.Col); !ok || len(l.byName[c.Name]) == 0 {
-						g = items[pos].Expr
-					}
-				}
+			for i, g := range gexprs {
 				v, err := e.eval(g)
 				if err != nil {
 					return err
 				}
-				kv = append(kv, v)
+				kv[i] = v
 			}
-			k := key(kv)
-			g := groups[k]
-			if g == nil {
-				g = &group{first: append([]Value(nil), r...), accs: newAccs(fns)}
-				groups[k] = g
-				keys = append(keys, k)
+			var gi int
+			var ok bool
+			if len(kv) == 1 {
+				gi, ok = one.get(kv[0])
+			} else {
+				gi, ok = groups[key(kv)]
 			}
+			if !ok {
+				gi = len(glist)
+				glist = append(glist, &group{first: append([]Value(nil), r...), accs: newAccs(fns)})
+				if len(kv) == 1 {
+					one.put(kv[0], gi)
+				} else {
+					groups[key(kv)] = gi
+				}
+			}
+			g := glist[gi]
 			for i, f := range fns {
 				if a := g.accs[i]; a.err == nil {
 					a.err = a.add(f, e)
@@ -1028,15 +1130,13 @@ func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value)
 		if err != nil {
 			return nil, err
 		}
-		if len(sel.GroupBy) == 0 && len(keys) == 0 {
-			keys = append(keys, "")
-			groups[""] = &group{accs: newAccs(fns)}
+		if len(sel.GroupBy) == 0 && len(glist) == 0 {
+			glist = append(glist, &group{accs: newAccs(fns)})
 		}
 		if sel.Having != nil && neverTrue(sel.Having) {
-			keys = nil
+			glist = nil
 		}
-		for _, k := range keys {
-			g := groups[k]
+		for _, g := range glist {
 			e := &env{l: l, outer: outer, s: s, params: s.params, row: g.first, aggs: map[*sql.Func]Value{}}
 			for i, f := range fns {
 				v, err := g.accs[i].result(f, e)
