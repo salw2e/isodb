@@ -397,6 +397,27 @@ func (r *reader) str() string {
 	return s
 }
 
+// skip passes over one value without decoding it.
+func (r *reader) skip() {
+	switch r.byte() {
+	case 1, 2:
+		if len(r.b) < 8 {
+			r.err = true
+			return
+		}
+		r.b = r.b[8:]
+	case 3:
+		n := r.uvarint()
+		if uint64(len(r.b)) < n {
+			r.err = true
+			return
+		}
+		r.b = r.b[n:]
+	case 4:
+		r.byte()
+	}
+}
+
 func (r *reader) value() Value {
 	switch r.byte() {
 	case 0:

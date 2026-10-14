@@ -28,10 +28,24 @@ func encodeRow(vals []Value) []byte {
 }
 
 func decodeRow(b []byte) []Value {
+	return decodeInto(nil, b, nil)
+}
+
+// decodeInto decodes a row into buf's space when it is big enough. Columns need marks false are
+// skipped and left NULL; a nil need decodes them all.
+func decodeInto(buf []Value, b []byte, need []bool) []Value {
 	r := &reader{b: b}
 	n := r.uvarint()
-	vals := make([]Value, 0, n)
+	vals := buf[:0]
+	if uint64(cap(buf)) < n {
+		vals = make([]Value, 0, n)
+	}
 	for i := uint64(0); i < n && !r.err; i++ {
+		if need != nil && i < uint64(len(need)) && !need[i] {
+			r.skip()
+			vals = append(vals, nil)
+			continue
+		}
 		vals = append(vals, r.value())
 	}
 	if r.err {
@@ -101,6 +115,51 @@ func (db *DB) each(tb *Table, fn func(*Row) error) error {
 		}
 		if err := fn(r); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// visible calls fn with the values of every row of tb that t can see. A row only in the page file
+// is visible to everyone as it is there, so it comes without a *Row, decoded only in the columns
+// need marks (all when nil); with reuse its values share one buffer, valid until fn returns.
+func (db *DB) visible(t *Txn, tb *Table, reuse bool, need []bool, fn func([]Value, *Row) error) error {
+	db.scan(t, tb)
+	if db.pg != nil && tb.root != 0 {
+		var buf []Value
+		var ferr error
+		err := db.pg.scan(tb.root, func(k, v []byte) bool {
+			if len(tb.rows) > 0 {
+				if _, ok := tb.rows[string(k)]; ok {
+					return true
+				}
+			}
+			vals := decodeInto(buf, v, need)
+			if reuse {
+				buf = vals
+			}
+			ferr = fn(vals, nil)
+			return ferr == nil
+		})
+		if ferr != nil {
+			return ferr
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, r := range tb.order {
+		if tb.rows[r.key] != r || len(r.vers) == 0 {
+			continue
+		}
+		vals, err := db.read(t, tb, r)
+		if err != nil {
+			return err
+		}
+		if vals != nil {
+			if err := fn(vals, r); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

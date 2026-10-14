@@ -728,14 +728,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				}
 				rng = nil // read it all instead; the rows come in no particular order
 			}
-			s.db.scan(s.tx, src.table)
-			return s.db.each(src.table, func(r *Row) error {
-				vals, err := s.db.read(s.tx, src.table, r)
-				if err != nil || vals == nil {
-					return err
-				}
-				return visit(vals, r)
-			})
+			return s.db.visible(s.tx, src.table, true, neededCols(sel, order, l), visit)
 		}
 		j := joinOrder[p]
 		src := srcs[j]
@@ -823,6 +816,40 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		sink = f
 		return loop(0)
 	}, outer, order, final, rng != nil && rng.ordered)
+}
+
+// neededCols marks the columns a query reads, or returns nil when it may read any of them.
+func neededCols(sel *sql.Select, order []sql.Order, l *layout) []bool {
+	need := make([]bool, len(l.cols))
+	all := false
+	mark := func(x sql.Expr) {
+		if hasSubquery(x) {
+			all = true
+		}
+		walk(x, func(e sql.Expr) {
+			if c, ok := e.(*sql.Col); ok {
+				for _, i := range l.byName[c.Name] {
+					need[i] = true
+				}
+			}
+		})
+	}
+	for _, it := range sel.Items {
+		if it.Star {
+			return nil
+		}
+		mark(it.Expr)
+	}
+	for _, x := range append([]sql.Expr{sel.Where, sel.Having}, sel.GroupBy...) {
+		mark(x)
+	}
+	for _, o := range order {
+		mark(o.Expr)
+	}
+	if all {
+		return nil
+	}
+	return need
 }
 
 func fromRows(rows [][]Value) func(func([]Value) error) error {
