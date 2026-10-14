@@ -34,6 +34,7 @@ type wal struct {
 	f     *os.File
 	size  int64
 	alloc int64 // bytes of the file zero-filled so far
+	lock  *os.File
 	fault float64
 
 	mu      sync.Mutex
@@ -49,7 +50,11 @@ func openWAL(db *DB, dir string) (*wal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	w := &wal{db: db, dir: dir, done: make(chan struct{})}
+	lock, err := lockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	w := &wal{db: db, dir: dir, done: make(chan struct{}), lock: lock}
 	w.cond = sync.NewCond(&w.mu)
 	if s := os.Getenv("ISODB_FAULT"); s != "" {
 		w.fault, _ = strconv.ParseFloat(s, 64)
@@ -375,6 +380,9 @@ func (w *wal) close() error {
 	defer w.db.mu.Unlock()
 	if err := w.checkpoint(w.db); err != nil {
 		return err
+	}
+	if w.lock != nil {
+		defer w.lock.Close()
 	}
 	return w.f.Close()
 }
