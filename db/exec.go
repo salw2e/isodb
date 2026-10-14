@@ -564,7 +564,7 @@ func (s *Session) returning(tb *Table, items []sql.SelItem, rows [][]Value, res 
 	}
 	l := newLayout(s.tableCols(tb, tb.Name))
 	sel := &sql.Select{Items: items}
-	r, err := s.project(sel, l, rows, nil, nil, false)
+	r, err := s.project(sel, l, fromRows(rows), nil, nil, false)
 	if err != nil {
 		return err
 	}
@@ -757,23 +757,28 @@ func (s *Session) matching(tb *Table, alias string, where sql.Expr) ([]match, *e
 			}
 		}
 	}
-	if !done {
-		rows, refs, err := s.visibleRows(tb)
-		if err != nil {
-			return nil, nil, err
-		}
-		for i := range rows {
-			cands = append(cands, match{refs[i], rows[i]})
-		}
-	}
 	var out []match
-	for _, m := range cands {
+	keep := func(m match) error {
 		ok, err := s.test(e, m.vals, where)
-		if err != nil {
-			return nil, nil, err
-		}
 		if ok {
 			out = append(out, m)
+		}
+		return err
+	}
+	if !done {
+		s.db.scan(s.tx, tb)
+		err := s.db.each(tb, func(r *Row) error {
+			vals, err := s.db.read(s.tx, tb, r)
+			if err != nil || vals == nil {
+				return err
+			}
+			return keep(match{r, vals})
+		})
+		return out, e, err
+	}
+	for _, m := range cands {
+		if err := keep(m); err != nil {
+			return nil, nil, err
 		}
 	}
 	return out, e, nil

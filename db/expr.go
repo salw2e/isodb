@@ -1189,3 +1189,148 @@ func walkAll(x sql.Expr, fn func(sql.Expr), sub func(*sql.Select)) {
 		}
 	})
 }
+
+// aggregateCalls lists the aggregate calls of a grouped query, not those inside subqueries.
+func aggregateCalls(items []sql.SelItem, having sql.Expr, order []sql.Order) []*sql.Func {
+	var out []*sql.Func
+	seen := map[*sql.Func]bool{}
+	visit := func(x sql.Expr) {
+		walk(x, func(e sql.Expr) {
+			if f, ok := e.(*sql.Func); ok && aggregates[f.Name] && !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		})
+	}
+	for _, it := range items {
+		visit(it.Expr)
+	}
+	visit(having)
+	for _, o := range order {
+		visit(o.Expr)
+	}
+	return out
+}
+
+// acc is the running state of one aggregate call for one group.
+type acc struct {
+	n     int64
+	sum   Value
+	fsum  float64
+	best  Value
+	b     Value
+	strs  []string
+	sep   Value
+	seen  map[string]bool
+}
+
+func newAccs(fns []*sql.Func) []*acc {
+	out := make([]*acc, len(fns))
+	for i := range out {
+		out[i] = &acc{}
+	}
+	return out
+}
+
+func (a *acc) add(f *sql.Func, e *env) error {
+	if f.Name == "count" && f.Star {
+		a.n++
+		return nil
+	}
+	if len(f.Args) == 0 {
+		return errf("42883", "function %s() does not exist", f.Name)
+	}
+	v, err := e.eval(f.Args[0])
+	if err != nil || v == nil {
+		return err
+	}
+	if f.Distinct {
+		k := key([]Value{v})
+		if a.seen == nil {
+			a.seen = map[string]bool{}
+		}
+		if a.seen[k] {
+			return nil
+		}
+		a.seen[k] = true
+	}
+	a.n++
+	switch f.Name {
+	case "sum", "total":
+		if s, ok := v.(string); ok {
+			if v, err = toFloat(s); err != nil {
+				return err
+			}
+		}
+		if a.sum == nil {
+			a.sum = int64(0)
+		}
+		a.sum, err = arith("+", a.sum, v)
+		return err
+	case "avg":
+		x, err := toFloat(v)
+		a.fsum += x
+		return err
+	case "min", "max":
+		if a.best == nil {
+			a.best = v
+			return nil
+		}
+		c, err := compare(v, a.best)
+		if f.Name == "min" && c < 0 || f.Name == "max" && c > 0 {
+			a.best = v
+		}
+		return err
+	case "bool_and", "every", "bool_or":
+		x, err := toBool(v)
+		if a.b == nil {
+			a.b = x
+		} else if f.Name == "bool_or" {
+			a.b = a.b.(bool) || x
+		} else {
+			a.b = a.b.(bool) && x
+		}
+		return err
+	case "string_agg", "group_concat":
+		a.strs = append(a.strs, text(v))
+		if a.sep == nil && len(f.Args) > 1 {
+			if a.sep, err = e.eval(f.Args[1]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *acc) result(f *sql.Func, e *env) (Value, error) {
+	switch f.Name {
+	case "count":
+		return a.n, nil
+	case "sum":
+		return a.sum, nil
+	case "total":
+		if a.sum == nil {
+			return 0.0, nil
+		}
+		return toFloat(a.sum)
+	case "avg":
+		if a.n == 0 {
+			return nil, nil
+		}
+		return a.fsum / float64(a.n), nil
+	case "min", "max":
+		return a.best, nil
+	case "bool_and", "every", "bool_or":
+		return a.b, nil
+	case "string_agg", "group_concat":
+		if len(a.strs) == 0 {
+			return nil, nil
+		}
+		sep := ","
+		if a.sep != nil {
+			sep = text(a.sep)
+		}
+		return strings.Join(a.strs, sep), nil
+	}
+	return nil, errf(codeFeature, "aggregate %s is not supported", f.Name)
+}
