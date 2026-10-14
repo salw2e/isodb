@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 
@@ -16,11 +15,16 @@ import (
 )
 
 // The write-ahead log is a sequence of records: [length u32][crc32c u32][payload].
-// A commit is durable once its record is written and fsynced. On start the snapshot is loaded,
-// then every log record newer than it is replayed; a torn record at the end is cut off.
-// When the log passes maxLog bytes the whole committed state is written to a new snapshot.
+// A commit is durable once its record is written and fsynced. On start the last checkpoint is
+// opened, then every log record newer than it is replayed; a torn record at the end is cut off.
+// When the log passes maxLog bytes the committed state is written to the page file (a checkpoint).
 
-const maxLog = 64 << 20
+var maxLog = func() int64 {
+	if n, err := strconv.ParseInt(os.Getenv("ISODB_MAXLOG"), 10, 64); err == nil && n > 0 {
+		return n
+	}
+	return 64 << 20
+}()
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -50,15 +54,10 @@ func openWAL(db *DB, dir string) (*wal, error) {
 		w.fault, _ = strconv.ParseFloat(s, 64)
 	}
 	db.recovering = true
-	snapTS := int64(0)
-	if b, err := os.ReadFile(filepath.Join(dir, "snapshot")); err == nil {
-		if _, _, err := db.replay(b, -1); err != nil {
-			return nil, fmt.Errorf("snapshot: %w", err)
-		}
-		snapTS = db.ts
-	} else if !os.IsNotExist(err) {
-		return nil, err
+	if err := db.openPages(dir); err != nil {
+		return nil, fmt.Errorf("page file: %w", err)
 	}
+	snapTS := db.ts
 	path := filepath.Join(dir, "wal")
 	b, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -156,7 +155,8 @@ func (db *DB) apply(s *Session, typ byte, ts int64, r *reader) error {
 			if tb := db.tables[name]; tb != nil {
 				row := db.row(tb, k)
 				row.vers = []*Version{{tx: tx, vals: vals, dead: dead}}
-				if dead {
+				if dead && db.pg == nil {
+					// with a page file the deletion has to stay until a checkpoint removes the row there
 					row.vers = nil
 				}
 			}
@@ -313,60 +313,9 @@ func (w *wal) commitRecord(db *DB, t *Txn) []byte {
 	})
 }
 
-// checkpoint writes every table and its committed rows to a new snapshot, then empties the log.
+// checkpoint writes the committed state to the page file, then empties the log.
 func (w *wal) checkpoint(db *DB) error {
-	var buf []byte
-	names := make([]string, 0, len(db.tables))
-	for n := range db.tables {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	ddl := func(text string) {
-		p := []byte{'D'}
-		p = binary.LittleEndian.AppendUint64(p, 0)
-		p = binary.AppendUvarint(p, uint64(len(text)))
-		buf = append(buf, frame(append(p, text...))...)
-	}
-	for _, n := range names {
-		ddl(db.tables[n].ddl)
-	}
-	for _, text := range db.indexDDL() {
-		ddl(text)
-	}
-	for _, n := range names {
-		tb := db.tables[n]
-		var rows []*Row
-		for _, r := range tb.order {
-			if v := latestCommitted(r); v != nil && !v.dead {
-				rows = append(rows, r)
-			}
-		}
-		buf = append(buf, commitRecord(0, rows, map[*Table]bool{tb: true}, latestCommitted)...)
-	}
-	// the last record carries the snapshot's timestamp
-	p := []byte{'C'}
-	p = binary.LittleEndian.AppendUint64(p, uint64(db.ts))
-	p = append(p, 0, 0)
-	buf = append(buf, frame(p)...)
-
-	tmp := filepath.Join(w.dir, "snapshot.tmp")
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	f.Close()
-	if err := os.Rename(tmp, filepath.Join(w.dir, "snapshot")); err != nil {
-		return err
-	}
-	if err := syncDir(w.dir); err != nil {
+	if err := db.flush(); err != nil {
 		return err
 	}
 	if err := w.f.Truncate(0); err != nil {

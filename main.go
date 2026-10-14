@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 
 	"isodb/db"
@@ -16,6 +17,13 @@ func main() {
 	addr := flag.String("listen", "127.0.0.1:15433", "address to listen on")
 	dir := flag.String("data", "data", "data directory, empty for memory only")
 	flag.Parse()
+	if path := os.Getenv("ISODB_CPUPROFILE"); path != "" {
+		f, err := os.Create(path)
+		if err == nil {
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
+	}
 	d, err := db.Open(*dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "isodb:", err)
@@ -32,6 +40,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		ln.Close()
+		pprof.StopCPUProfile()
 		if err := d.Close(); err != nil {
 			fmt.Fprintln(os.Stderr, "isodb:", err)
 			os.Exit(1)

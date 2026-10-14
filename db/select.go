@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"sort"
 
 	"isodb/sql"
@@ -38,20 +39,18 @@ func (s *Session) visibleRows(tb *Table) ([][]Value, []*Row, error) {
 	db.scan(s.tx, tb)
 	var rows [][]Value
 	var refs []*Row
-	for _, r := range tb.order {
-		if len(r.vers) == 0 {
-			continue
-		}
+	err := db.each(tb, func(r *Row) error {
 		vals, err := db.read(s.tx, tb, r)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		if vals != nil {
 			rows = append(rows, vals)
 			refs = append(refs, r)
 		}
-	}
-	return rows, refs, nil
+		return nil
+	})
+	return rows, refs, err
 }
 
 func (s *Session) lookup(tb *Table, k string) ([]Value, *Row, error) {
@@ -330,7 +329,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	}
 	// a HAVING clause without aggregates is part of WHERE for Postgres
 	if sel.Where != nil && neverTrue(sel.Where) || sel.Having != nil && !hasAggregate(sel.Having) && neverTrue(sel.Having) {
-		return s.project(sel, l, nil, outer, order, final)
+		return s.project(sel, l, fromRows(nil), outer, order, final)
 	}
 	e := &env{l: l, outer: outer, s: s, params: s.params}
 	cur := make([]Value, len(all))
@@ -398,9 +397,13 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 	}
 
+	// one table without a key lookup is read straight from storage, row by row
+	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && !sel.ForUpdate
+	var streamConds []sql.Expr
+
 	// load each table and filter it by the conditions that read only that table
 	for i, src := range srcs {
-		if src.table != nil {
+		if src.table != nil && !stream {
 			if src.pk != nil {
 				e.row = cur
 				v, err := e.eval(src.pk)
@@ -429,6 +432,10 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				mine = append(mine, cj.x)
 				cj.done = true
 			}
+		}
+		if stream {
+			streamConds = mine
+			continue
 		}
 		if len(mine) == 0 {
 			continue
@@ -551,8 +558,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 	}
 
-	var rows [][]Value
-	var refs [][]*Row
+	var sink func([]Value) error
 	var loop func(p int) error
 	loop = func(p int) error {
 		if p == n {
@@ -560,9 +566,24 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 			if err != nil || !ok {
 				return err
 			}
-			rows = append(rows, append([]Value(nil), cur...))
-			refs = append(refs, append([]*Row(nil), curRefs...))
-			return nil
+			return sink(cur)
+		}
+		if p == 0 && stream {
+			src := srcs[0]
+			s.db.scan(s.tx, src.table)
+			conds := append(append([]sql.Expr(nil), streamConds...), levels[0]...)
+			return s.db.each(src.table, func(r *Row) error {
+				vals, err := s.db.read(s.tx, src.table, r)
+				if err != nil || vals == nil {
+					return err
+				}
+				copy(cur, vals)
+				ok, err := test(conds)
+				if err != nil || !ok {
+					return err
+				}
+				return loop(1)
+			})
 		}
 		j := joinOrder[p]
 		src := srcs[j]
@@ -615,27 +636,48 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 		return nil
 	}
-	if err := loop(0); err != nil {
-		return nil, err
-	}
-
 	if sel.ForUpdate {
-		for _, rr := range refs {
-			for i, r := range rr {
-				if r == nil || srcs[i].table == nil {
-					continue
-				}
-				if err := s.db.lock(s.tx, srcs[i].table, r); err != nil {
-					return nil, err
+		// lock every row first, then project what was locked
+		var rows [][]Value
+		sink = func(row []Value) error {
+			for i, r := range curRefs {
+				if r != nil && srcs[i].table != nil {
+					if err := s.db.lock(s.tx, srcs[i].table, s.db.own(srcs[i].table, r)); err != nil {
+						return err
+					}
 				}
 			}
+			rows = append(rows, append([]Value(nil), row...))
+			return nil
 		}
+		if err := loop(0); err != nil {
+			return nil, err
+		}
+		return s.project(sel, l, fromRows(rows), outer, order, final)
 	}
-
-	return s.project(sel, l, rows, outer, order, final)
+	return s.project(sel, l, func(f func([]Value) error) error {
+		sink = f
+		return loop(0)
+	}, outer, order, final)
 }
 
-func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env, order []sql.Order, final bool) (*result, error) {
+func fromRows(rows [][]Value) func(func([]Value) error) error {
+	return func(f func([]Value) error) error {
+		for _, r := range rows {
+			if err := f(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// errEnough ends a scan early once LIMIT has its rows.
+var errEnough = errors.New("enough rows")
+
+// project turns source rows into output rows. Rows arrive one at a time from produce, so memory
+// grows with the output (or the number of groups), not with the tables read.
+func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value) error) error, outer *env, order []sql.Order, final bool) (*result, error) {
 	res := &result{}
 	var items []sql.SelItem
 	for _, it := range sel.Items {
@@ -709,11 +751,33 @@ func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env
 		outs = append(outs, o)
 		return nil
 	}
+	// without ORDER BY, DISTINCT or grouping, LIMIT can stop the scan early
+	want := -1
+	if final && !agg && len(order) == 0 && !sel.Distinct && sel.Limit != nil {
+		ce := &env{outer: outer, s: s, params: s.params}
+		if lv, err := ce.eval(sel.Limit); err == nil && lv != nil {
+			if n, err := toInt(lv); err == nil && n >= 0 {
+				want = int(n)
+				if sel.Offset != nil {
+					if ov, err := ce.eval(sel.Offset); err == nil && ov != nil {
+						if o, err := toInt(ov); err == nil && o > 0 {
+							want += int(o)
+						}
+					}
+				}
+			}
+		}
+	}
 	if agg {
-		var order2 []string
-		groups := map[string][][]Value{}
+		fns := aggregateCalls(items, sel.Having, order)
+		type group struct {
+			first []Value
+			accs  []*acc
+		}
+		var keys []string
+		groups := map[string]*group{}
 		e := &env{l: l, outer: outer, s: s, params: s.params}
-		for _, r := range rows {
+		err := produce(func(r []Value) error {
 			e.row = r
 			var kv []Value
 			for _, g := range sel.GroupBy {
@@ -725,28 +789,43 @@ func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env
 				}
 				v, err := e.eval(g)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				kv = append(kv, v)
 			}
 			k := key(kv)
-			if _, ok := groups[k]; !ok {
-				order2 = append(order2, k)
+			g := groups[k]
+			if g == nil {
+				g = &group{first: append([]Value(nil), r...), accs: newAccs(fns)}
+				groups[k] = g
+				keys = append(keys, k)
 			}
-			groups[k] = append(groups[k], r)
+			for i, f := range fns {
+				if a := g.accs[i]; a.err == nil {
+					a.err = a.add(f, e)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		if len(sel.GroupBy) == 0 && len(rows) == 0 {
-			order2 = append(order2, "")
-			groups[""] = [][]Value{}
+		if len(sel.GroupBy) == 0 && len(keys) == 0 {
+			keys = append(keys, "")
+			groups[""] = &group{accs: newAccs(fns)}
 		}
 		if sel.Having != nil && neverTrue(sel.Having) {
-			order2 = nil
+			keys = nil
 		}
-		for _, k := range order2 {
+		for _, k := range keys {
 			g := groups[k]
-			e := &env{l: l, outer: outer, s: s, params: s.params, group: g}
-			if len(g) > 0 {
-				e.row = g[0]
+			e := &env{l: l, outer: outer, s: s, params: s.params, row: g.first, aggs: map[*sql.Func]Value{}}
+			for i, f := range fns {
+				v, err := g.accs[i].result(f, e)
+				if err != nil {
+					return nil, err
+				}
+				e.aggs[f] = v
 			}
 			if sel.Having != nil {
 				v, err := e.eval(sel.Having)
@@ -767,11 +846,15 @@ func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env
 		}
 	} else {
 		e := &env{l: l, outer: outer, s: s, params: s.params}
-		for _, r := range rows {
-			e.row = r
-			if err := emit(e); err != nil {
-				return nil, err
+		err := produce(func(r []Value) error {
+			if want >= 0 && len(outs) >= want {
+				return errEnough
 			}
+			e.row = r
+			return emit(e)
+		})
+		if err != nil && err != errEnough {
+			return nil, err
 		}
 	}
 

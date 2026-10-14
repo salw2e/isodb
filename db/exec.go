@@ -322,6 +322,9 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 				}
 				return nil, errf(codeUndefTable, "table \"%s\" does not exist", n)
 			}
+			if tb := db.tables[n]; tb.root != 0 {
+				db.dropped = append(db.dropped, tb.root)
+			}
 			delete(db.tables, n)
 			for i, t := range db.indexes {
 				if t == n {
@@ -353,19 +356,23 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 		}
 		if st.Unique {
 			seen := map[string]bool{}
-			for _, r := range tb.order {
+			err := db.each(tb, func(r *Row) error {
 				v := latestCommitted(r)
 				if v == nil || v.dead {
-					continue
+					return nil
 				}
 				k, null := uniqueKey(v.vals, cols)
 				if null {
-					continue
+					return nil
 				}
 				if seen[k] {
-					return nil, errf(codeUnique, "could not create unique index \"%s\"", st.Name)
+					return errf(codeUnique, "could not create unique index \"%s\"", st.Name)
 				}
 				seen[k] = true
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
 			tb.Uniques = append(tb.Uniques, cols)
 		}
@@ -471,9 +478,9 @@ func (s *Session) checkUnique(tb *Table, self *Row, vals []Value) error {
 		if null {
 			continue
 		}
-		for _, r := range tb.order {
-			if r == self || len(r.vers) == 0 {
-				continue
+		err := s.db.each(tb, func(r *Row) error {
+			if r == self || r.key == self.key {
+				return nil
 			}
 			v := r.vers[len(r.vers)-1]
 			if v.tx != s.tx && v.tx.state != committed {
@@ -482,17 +489,20 @@ func (s *Session) checkUnique(tb *Table, self *Row, vals []Value) error {
 						return err
 					}
 				}
-				v = latest(s.tx, r)
-				if v == nil {
-					continue
+				if v = latest(s.tx, r); v == nil {
+					return nil
 				}
 			}
 			if v.dead {
-				continue
+				return nil
 			}
 			if k2, _ := uniqueKey(v.vals, cols); k2 == k {
 				return errf(codeUnique, "duplicate key value violates unique constraint on %s", tb.Name)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -554,7 +564,7 @@ func (s *Session) returning(tb *Table, items []sql.SelItem, rows [][]Value, res 
 	}
 	l := newLayout(s.tableCols(tb, tb.Name))
 	sel := &sql.Select{Items: items}
-	r, err := s.project(sel, l, rows, nil, nil, false)
+	r, err := s.project(sel, l, fromRows(rows), nil, nil, false)
 	if err != nil {
 		return err
 	}
@@ -617,6 +627,9 @@ func (s *Session) insert(st *sql.Insert) (*Result, error) {
 			s.tx.serials[tb] = true
 		} else {
 			k = tb.keyOf(vals)
+		}
+		if db.pg != nil && len(k) > maxKey {
+			return nil, errf("54000", "primary key of %d bytes is longer than %d", len(k), maxKey)
 		}
 		r := db.row(tb, k)
 		if err := db.lock(s.tx, tb, r); err != nil {
@@ -744,23 +757,28 @@ func (s *Session) matching(tb *Table, alias string, where sql.Expr) ([]match, *e
 			}
 		}
 	}
-	if !done {
-		rows, refs, err := s.visibleRows(tb)
-		if err != nil {
-			return nil, nil, err
-		}
-		for i := range rows {
-			cands = append(cands, match{refs[i], rows[i]})
-		}
-	}
 	var out []match
-	for _, m := range cands {
+	keep := func(m match) error {
 		ok, err := s.test(e, m.vals, where)
-		if err != nil {
-			return nil, nil, err
-		}
 		if ok {
 			out = append(out, m)
+		}
+		return err
+	}
+	if !done {
+		s.db.scan(s.tx, tb)
+		err := s.db.each(tb, func(r *Row) error {
+			vals, err := s.db.read(s.tx, tb, r)
+			if err != nil || vals == nil {
+				return err
+			}
+			return keep(match{r, vals})
+		})
+		return out, e, err
+	}
+	for _, m := range cands {
+		if err := keep(m); err != nil {
+			return nil, nil, err
 		}
 	}
 	return out, e, nil
@@ -781,7 +799,8 @@ func (s *Session) test(e *env, row []Value, where sql.Expr) (bool, error) {
 
 // relock takes the write lock on a matched row. Read committed then continues from the newest
 // committed version, re-checking the WHERE clause like Postgres does; snapshot levels fail instead.
-func (s *Session) relock(tb *Table, m match, e *env, where sql.Expr) ([]Value, error) {
+func (s *Session) relock(tb *Table, m *match, e *env, where sql.Expr) ([]Value, error) {
+	m.r = s.db.own(tb, m.r)
 	if err := s.db.lock(s.tx, tb, m.r); err != nil {
 		return nil, err
 	}
@@ -811,7 +830,8 @@ func (s *Session) update(st *sql.Update) (*Result, error) {
 	}
 	n := 0
 	var out [][]Value
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		old, err := s.relock(tb, m, e, st.Where)
 		if err != nil {
 			return nil, err
@@ -858,7 +878,8 @@ func (s *Session) delete(st *sql.Delete) (*Result, error) {
 	}
 	n := 0
 	var out [][]Value
-	for _, m := range ms {
+	for i := range ms {
+		m := &ms[i]
 		old, err := s.relock(tb, m, e, st.Where)
 		if err != nil {
 			return nil, err

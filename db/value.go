@@ -294,12 +294,10 @@ func key(vals []Value) string {
 		case nil:
 			b.WriteByte(0)
 		case int64:
-			b.WriteByte(1)
-			b.WriteString(strconv.FormatInt(x, 10))
+			intKey(&b, x)
 		case float64:
 			if x == math.Trunc(x) && math.Abs(x) < 1e18 {
-				b.WriteByte(1)
-				b.WriteString(strconv.FormatInt(int64(x), 10))
+				intKey(&b, int64(x))
 			} else {
 				b.WriteByte(2)
 				b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
@@ -318,6 +316,14 @@ func key(vals []Value) string {
 		b.WriteByte(0xff)
 	}
 	return b.String()
+}
+
+// intKey writes an integer as 8 big-endian bytes with the sign flipped, so keys sort numerically
+func intKey(b *strings.Builder, x int64) {
+	var buf [9]byte
+	buf[0] = 1
+	binary.BigEndian.PutUint64(buf[1:], uint64(x)^1<<63)
+	b.Write(buf[:])
 }
 
 // binary encoding used by the write-ahead log

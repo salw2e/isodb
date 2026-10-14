@@ -191,13 +191,31 @@ func (e *env) eval(x sql.Expr) (Value, error) {
 				list = append(list, r[0])
 			}
 		} else {
+			// like Postgres: x = a OR x = b ..., stopping at the first match
+			if len(x.List) == 0 {
+				return x.Not, nil
+			}
+			if v == nil {
+				return nil, nil
+			}
+			var r Value = false
 			for _, it := range x.List {
 				w, err := e.eval(it)
 				if err != nil {
 					return nil, err
 				}
-				list = append(list, w)
+				eq, err := cmpOp("=", v, w)
+				if err != nil {
+					return nil, err
+				}
+				if r = or3(r, eq); r == true {
+					break
+				}
 			}
+			if x.Not {
+				return not3(r), nil
+			}
+			return r, nil
 		}
 		if len(list) == 0 {
 			return x.Not, nil
@@ -385,6 +403,14 @@ func neverTrue(x sql.Expr) bool {
 		}
 		return nullConst(y.X) || nullConst(y.Lo) || nullConst(y.Hi)
 	case *sql.In:
+		if y.Not {
+			// x NOT IN (..., NULL) is ... AND x <> NULL, which is never true
+			for _, it := range y.List {
+				if nullConst(it) {
+					return true
+				}
+			}
+		}
 		return nullConst(y.X) && (len(y.List) > 0 || y.Sub != nil)
 	case *sql.IsNull:
 		return y.Not && nullConst(y.X)
@@ -654,6 +680,9 @@ func (e *env) call(f *sql.Func) (Value, error) {
 	if aggregates[f.Name] {
 		if e.aggs != nil {
 			if v, ok := e.aggs[f]; ok {
+				if ae, bad := v.(aggError); bad {
+					return nil, ae.err
+				}
 				return v, nil
 			}
 		}
@@ -1188,4 +1217,156 @@ func walkAll(x sql.Expr, fn func(sql.Expr), sub func(*sql.Select)) {
 			}
 		}
 	})
+}
+
+// aggregateCalls lists the aggregate calls of a grouped query, not those inside subqueries.
+func aggregateCalls(items []sql.SelItem, having sql.Expr, order []sql.Order) []*sql.Func {
+	var out []*sql.Func
+	seen := map[*sql.Func]bool{}
+	visit := func(x sql.Expr) {
+		walk(x, func(e sql.Expr) {
+			if f, ok := e.(*sql.Func); ok && aggregates[f.Name] && !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		})
+	}
+	for _, it := range items {
+		visit(it.Expr)
+	}
+	visit(having)
+	for _, o := range order {
+		visit(o.Expr)
+	}
+	return out
+}
+
+// aggError is an aggregate that failed; the query only fails if it uses the result.
+type aggError struct{ err error }
+
+// acc is the running state of one aggregate call for one group.
+type acc struct {
+	err   error
+	n     int64
+	sum   Value
+	fsum  float64
+	best  Value
+	b     Value
+	strs  []string
+	sep   Value
+	seen  map[string]bool
+}
+
+func newAccs(fns []*sql.Func) []*acc {
+	out := make([]*acc, len(fns))
+	for i := range out {
+		out[i] = &acc{}
+	}
+	return out
+}
+
+func (a *acc) add(f *sql.Func, e *env) error {
+	if f.Name == "count" && f.Star {
+		a.n++
+		return nil
+	}
+	if len(f.Args) == 0 {
+		return errf("42883", "function %s() does not exist", f.Name)
+	}
+	v, err := e.eval(f.Args[0])
+	if err != nil || v == nil {
+		return err
+	}
+	if f.Distinct {
+		k := key([]Value{v})
+		if a.seen == nil {
+			a.seen = map[string]bool{}
+		}
+		if a.seen[k] {
+			return nil
+		}
+		a.seen[k] = true
+	}
+	a.n++
+	switch f.Name {
+	case "sum", "total":
+		if s, ok := v.(string); ok {
+			if v, err = toFloat(s); err != nil {
+				return err
+			}
+		}
+		if a.sum == nil {
+			a.sum = int64(0)
+		}
+		a.sum, err = arith("+", a.sum, v)
+		return err
+	case "avg":
+		x, err := toFloat(v)
+		a.fsum += x
+		return err
+	case "min", "max":
+		if a.best == nil {
+			a.best = v
+			return nil
+		}
+		c, err := compare(v, a.best)
+		if f.Name == "min" && c < 0 || f.Name == "max" && c > 0 {
+			a.best = v
+		}
+		return err
+	case "bool_and", "every", "bool_or":
+		x, err := toBool(v)
+		if a.b == nil {
+			a.b = x
+		} else if f.Name == "bool_or" {
+			a.b = a.b.(bool) || x
+		} else {
+			a.b = a.b.(bool) && x
+		}
+		return err
+	case "string_agg", "group_concat":
+		a.strs = append(a.strs, text(v))
+		if a.sep == nil && len(f.Args) > 1 {
+			if a.sep, err = e.eval(f.Args[1]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *acc) result(f *sql.Func, e *env) (Value, error) {
+	if a.err != nil {
+		return aggError{a.err}, nil
+	}
+	switch f.Name {
+	case "count":
+		return a.n, nil
+	case "sum":
+		return a.sum, nil
+	case "total":
+		if a.sum == nil {
+			return 0.0, nil
+		}
+		return toFloat(a.sum)
+	case "avg":
+		if a.n == 0 {
+			return nil, nil
+		}
+		return a.fsum / float64(a.n), nil
+	case "min", "max":
+		return a.best, nil
+	case "bool_and", "every", "bool_or":
+		return a.b, nil
+	case "string_agg", "group_concat":
+		if len(a.strs) == 0 {
+			return nil, nil
+		}
+		sep := ","
+		if a.sep != nil {
+			sep = text(a.sep)
+		}
+		return strings.Join(a.strs, sep), nil
+	}
+	return nil, errf(codeFeature, "aggregate %s is not supported", f.Name)
 }

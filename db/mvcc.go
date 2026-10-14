@@ -38,13 +38,16 @@ type Table struct {
 	nextID  int64
 	readers map[*Txn]bool
 	ddl     string
+	root    pageID
 }
 
 type Row struct {
 	tb      *Table
 	key     string
-	vers    []*Version
-	readers map[*Txn]bool
+	vers      []*Version
+	readers   map[*Txn]bool
+	disk      *Version // the version the page file holds
+	transient bool     // met during a scan of the page file, not kept in memory
 }
 
 type Version struct {
@@ -87,6 +90,9 @@ type DB struct {
 	active   map[*Txn]bool
 	retained []*Txn
 	wal      *wal
+	pg       *pager
+	dropped  []pageID
+	waiting  int
 	ddl      []string
 	recovering bool
 }
@@ -190,7 +196,9 @@ func (db *DB) lock(t *Txn, tb *Table, r *Row) error {
 				}
 			}
 			t.waitFor = w
+			db.waiting++
 			db.cond.Wait()
+			db.waiting--
 			t.waitFor = nil
 			if t.state != active {
 				return errf(codeSerialization, "transaction was aborted")
@@ -242,16 +250,6 @@ func (db *DB) write(t *Txn, tb *Table, r *Row, vals []Value, dead bool) {
 		t.written[r] = true
 		t.writes = append(t.writes, r)
 	}
-}
-
-func (db *DB) row(tb *Table, k string) *Row {
-	r := tb.rows[k]
-	if r == nil {
-		r = &Row{tb: tb, key: k}
-		tb.rows[k] = r
-		tb.order = append(tb.order, r)
-	}
-	return r
 }
 
 func (db *DB) begin(iso int, explicit bool) *Txn {
@@ -322,6 +320,9 @@ func (db *DB) abortTx(t *Txn) {
 		}
 	}
 	db.release(t)
+	for _, r := range t.writes {
+		db.trim(r)
+	}
 	delete(db.active, t)
 	db.cleanup(nil)
 	db.cond.Broadcast()
@@ -330,6 +331,7 @@ func (db *DB) abortTx(t *Txn) {
 func (db *DB) release(t *Txn) {
 	for _, r := range t.readRows {
 		delete(r.readers, t)
+		db.trim(r)
 	}
 	for _, tb := range t.readTables {
 		delete(tb.readers, t)
@@ -371,7 +373,7 @@ func (db *DB) cleanup(t *Txn) {
 				break
 			}
 		}
-		if len(r.vers) == 1 && r.vers[0].dead && r.vers[0].tx.state == committed && r.vers[0].tx.commit <= h && len(r.readers) == 0 {
+		if db.pg == nil && len(r.vers) == 1 && r.vers[0].dead && r.vers[0].tx.state == committed && r.vers[0].tx.commit <= h && len(r.readers) == 0 {
 			r.vers = nil
 		}
 	}
