@@ -41,6 +41,7 @@ p = start()
 c = connect().cursor()
 c.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)")
 c.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, note TEXT)")
+c.execute("CREATE UNIQUE INDEX log_note ON log (note)")
 for i in range(ACCOUNTS):
     c.execute("INSERT INTO accounts VALUES (%s, %s)", (i, START))
 acked = set()
@@ -95,7 +96,10 @@ def inserts(stop):
                 with lock:
                     maybe_deleted.add(gone)
                 cur = conn.cursor()
-                cur.execute("DELETE FROM log WHERE id = %s", (gone,))
+                if random.random() < 0.5:
+                    cur.execute("DELETE FROM log WHERE id = %s", (gone,))
+                else:
+                    cur.execute("DELETE FROM log WHERE note = %s", ("row %d" % gone,))
                 with lock:
                     maybe_deleted.discard(gone)
                 if cur.rowcount == 1:
@@ -120,6 +124,10 @@ def check():
     back = deleted & have
     if back:
         raise SystemExit(f"FAIL: {len(back)} acknowledged deletes undone, e.g. {sorted(back)[:5]}")
+    for i in random.sample(range(1, next_id[0] + 1), min(300, next_id[0])):
+        cur.execute("SELECT id FROM log WHERE note = %s", ("row %d" % i,))
+        if (cur.fetchone() is not None) != (i in have):
+            raise SystemExit(f"FAIL: index on note disagrees with the table for row {i}")
 
 for rnd in range(args.rounds):
     stop = threading.Event()
