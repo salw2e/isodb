@@ -44,6 +44,8 @@ c.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, note TEXT)")
 for i in range(ACCOUNTS):
     c.execute("INSERT INTO accounts VALUES (%s, %s)", (i, START))
 acked = set()
+deleted = set()
+maybe_deleted = set()  # the server died before saying whether the delete happened
 next_id = [0]
 lock = threading.Lock()
 stats = {"transfers": 0, "inserts": 0, "kills": 0, "torn": 0}
@@ -61,7 +63,9 @@ def transfers(stop):
             amt = random.randint(1, 50)
             if bal >= amt:
                 cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amt, a))
-                cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amt, b))
+                # id + 0 cannot use the primary key, so this one finds its row with a full scan
+                where = "id + 0" if random.random() < 0.5 else "id"
+                cur.execute(f"UPDATE accounts SET balance = balance + %s WHERE {where} = %s", (amt, b))
             cur.execute("COMMIT")
             with lock:
                 stats["transfers"] += 1
@@ -86,6 +90,18 @@ def inserts(stop):
             with lock:
                 acked.add(i)
                 stats["inserts"] += 1
+            if i % 3 == 0:
+                gone = i - 2
+                with lock:
+                    maybe_deleted.add(gone)
+                cur = conn.cursor()
+                cur.execute("DELETE FROM log WHERE id = %s", (gone,))
+                with lock:
+                    maybe_deleted.discard(gone)
+                if cur.rowcount == 1:
+                    with lock:
+                        deleted.add(gone)
+                        stats["deletes"] = stats.get("deletes", 0) + 1
         except Exception:
             conn = None
             time.sleep(0.05)
@@ -98,9 +114,12 @@ def check():
         raise SystemExit(f"FAIL: accounts sum {total} count {n}, want {ACCOUNTS * START} {ACCOUNTS}")
     cur.execute("SELECT id FROM log")
     have = {r[0] for r in cur.fetchall()}
-    lost = acked - have
+    lost = acked - deleted - maybe_deleted - have
     if lost:
         raise SystemExit(f"FAIL: {len(lost)} acknowledged inserts lost, e.g. {sorted(lost)[:5]}")
+    back = deleted & have
+    if back:
+        raise SystemExit(f"FAIL: {len(back)} acknowledged deletes undone, e.g. {sorted(back)[:5]}")
 
 for rnd in range(args.rounds):
     stop = threading.Event()
@@ -120,8 +139,12 @@ for rnd in range(args.rounds):
     for t in ts:
         t.join()
     p = start()
-    check()
-    print(f"round {rnd + 1}: ok, {len(acked)} acknowledged inserts all present, total balance intact", flush=True)
+    try:
+        check()
+    except SystemExit:
+        p.kill()
+        raise
+    print(f"round {rnd + 1}: ok, {len(acked)} acknowledged inserts and {len(deleted)} deletes kept, total balance intact", flush=True)
 
 p.send_signal(signal.SIGTERM)
 p.wait()
