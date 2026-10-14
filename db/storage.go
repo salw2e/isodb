@@ -162,6 +162,9 @@ func (db *DB) openPages(dir string) error {
 		if tb := db.tables[string(k)]; tb != nil && len(v) == 16 {
 			tb.root = pageID(binary.LittleEndian.Uint64(v))
 			tb.nextID = int64(binary.LittleEndian.Uint64(v[8:]))
+		} else if len(v) == 8 && k[1] == 'i' {
+			// an index tree from before indexes held NULLs: free it, the index is built again
+			db.dropped = append(db.dropped, pageID(binary.LittleEndian.Uint64(v)))
 		} else if len(v) == 8 {
 			roots[string(k)] = pageID(binary.LittleEndian.Uint64(v))
 		}
@@ -322,7 +325,7 @@ func (db *DB) settled(r *Row, h int64) bool {
 }
 
 func indexEntry(tb *Table, ix *Index) string {
-	return "\x00i" + tb.Name + "\x00" + ix.Name
+	return "\x00j" + tb.Name + "\x00" + ix.Name
 }
 
 func sortedKeys(m map[string][]byte) []string {
@@ -340,12 +343,10 @@ func (db *DB) flushIndexes(tb *Table, r *Row, v *Version) error {
 		var old, now string
 		var oldOK, nowOK bool
 		if r.disk != nil && !r.disk.dead {
-			k, null := ix.key(r.disk.vals)
-			old, oldOK = k+r.key, !null
+			old, oldOK = ix.entry(r.disk.vals)+r.key, true
 		}
 		if !v.dead {
-			k, null := ix.key(v.vals)
-			now, nowOK = k+r.key, !null
+			now, nowOK = ix.entry(v.vals)+r.key, true
 		}
 		if oldOK == nowOK && old == now {
 			continue

@@ -339,7 +339,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	}
 	// a HAVING clause without aggregates is part of WHERE for Postgres
 	if sel.Where != nil && neverTrue(sel.Where) || sel.Having != nil && !hasAggregate(sel.Having) && neverTrue(sel.Having) {
-		return s.project(sel, l, fromRows(nil), outer, order, final)
+		return s.project(sel, l, fromRows(nil), outer, order, final, false)
 	}
 	e := &env{l: l, outer: outer, s: s, params: s.params}
 	cur := make([]Value, len(all))
@@ -472,6 +472,16 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	// one table without a key lookup is read straight from storage, row by row
 	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && srcs[0].ix == nil && !sel.ForUpdate
 	var streamConds []sql.Expr
+	var rng *rangeScan
+	if stream {
+		var where []sql.Expr
+		for _, cj := range conjs {
+			if !cj.final {
+				where = append(where, cj.x)
+			}
+		}
+		rng = planRange(srcs[0], where, sel, order, l, starts)
+	}
 
 	// load each table and filter it by the conditions that read only that table; a table that can
 	// be probed is left unloaded when the rows driving it are few next to its size
@@ -702,19 +712,29 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 		if p == 0 && stream {
 			src := srcs[0]
-			s.db.scan(s.tx, src.table)
 			conds := append(append([]sql.Expr(nil), streamConds...), levels[0]...)
-			return s.db.each(src.table, func(r *Row) error {
-				vals, err := s.db.read(s.tx, src.table, r)
-				if err != nil || vals == nil {
-					return err
-				}
+			visit := func(vals []Value, _ *Row) error {
 				copy(cur, vals)
 				ok, err := test(conds)
 				if err != nil || !ok {
 					return err
 				}
 				return loop(1)
+			}
+			if rng != nil {
+				e.row = cur
+				if done, err := s.scanRange(src.table, rng, e, visit); done || err != nil {
+					return err
+				}
+				rng = nil // read it all instead; the rows come in no particular order
+			}
+			s.db.scan(s.tx, src.table)
+			return s.db.each(src.table, func(r *Row) error {
+				vals, err := s.db.read(s.tx, src.table, r)
+				if err != nil || vals == nil {
+					return err
+				}
+				return visit(vals, r)
 			})
 		}
 		j := joinOrder[p]
@@ -797,12 +817,12 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		if err := loop(0); err != nil {
 			return nil, err
 		}
-		return s.project(sel, l, fromRows(rows), outer, order, final)
+		return s.project(sel, l, fromRows(rows), outer, order, final, false)
 	}
 	return s.project(sel, l, func(f func([]Value) error) error {
 		sink = f
 		return loop(0)
-	}, outer, order, final)
+	}, outer, order, final, rng != nil && rng.ordered)
 }
 
 func fromRows(rows [][]Value) func(func([]Value) error) error {
@@ -821,7 +841,8 @@ var errEnough = errors.New("enough rows")
 
 // project turns source rows into output rows. Rows arrive one at a time from produce, so memory
 // grows with the output (or the number of groups), not with the tables read.
-func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value) error) error, outer *env, order []sql.Order, final bool) (*result, error) {
+// project turns rows into the result. sorted says they already come in ORDER BY order.
+func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value) error) error, outer *env, order []sql.Order, final, sorted bool) (*result, error) {
 	res := &result{}
 	var items []sql.SelItem
 	for _, it := range sel.Items {
@@ -895,9 +916,10 @@ func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value)
 		outs = append(outs, o)
 		return nil
 	}
-	// without ORDER BY, DISTINCT or grouping, LIMIT can stop the scan early
+	// without ORDER BY (or with rows already in its order), DISTINCT or grouping, LIMIT can stop
+	// the scan early
 	want := -1
-	if final && !agg && len(order) == 0 && !sel.Distinct && sel.Limit != nil {
+	if final && !agg && (len(order) == 0 || sorted) && !sel.Distinct && sel.Limit != nil {
 		ce := &env{outer: outer, s: s, params: s.params}
 		if lv, err := ce.eval(sel.Limit); err == nil && lv != nil {
 			if n, err := toInt(lv); err == nil && n >= 0 {
