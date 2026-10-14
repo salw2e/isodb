@@ -583,6 +583,10 @@ func (p *pager) putIn(id pageID, k, v []byte) ([]piece, error) {
 }
 
 func (p *pager) replaceKid(n *node, ci int, parts []piece) {
+	if len(parts) == 1 {
+		n.kids[ci] = parts[0].id // n is writable, and nearly every insert lands here
+		return
+	}
 	kids := append(append([]pageID(nil), n.kids[:ci]...), parts[0].id)
 	keys := append([][]byte(nil), n.keys[:ci]...)
 	for _, x := range parts[1:] {
