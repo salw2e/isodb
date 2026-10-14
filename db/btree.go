@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"os"
 	"sort"
+	"sync"
 )
 
 // The page file holds copy-on-write B+trees. Pages are never changed in place once a checkpoint has
@@ -41,6 +42,7 @@ type meta struct {
 type pager struct {
 	f     *os.File
 	m     meta
+	mu    sync.Mutex
 	cache map[pageID]*node
 	lru   *list.List
 	limit int
@@ -134,21 +136,30 @@ func (p *pager) drop(n *node) {
 	}
 }
 
+// load may run from several reading statements at once, so the cache is guarded by p.mu.
 func (p *pager) load(id pageID) (*node, error) {
+	p.mu.Lock()
 	if n := p.cache[id]; n != nil {
 		if n.elem != nil {
 			p.lru.MoveToFront(n.elem)
 		}
+		p.mu.Unlock()
 		return n, nil
 	}
+	p.mu.Unlock()
 	b := make([]byte, pageSize)
 	if _, err := p.f.ReadAt(b, int64(id)*pageSize); err != nil {
 		return nil, err
 	}
-	p.reads++
 	n, err := p.decode(id, b)
 	if err != nil {
 		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reads++
+	if c := p.cache[id]; c != nil {
+		return c, nil
 	}
 	p.cache[id] = n
 	n.elem = p.lru.PushFront(n)

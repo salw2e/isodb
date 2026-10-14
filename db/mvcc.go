@@ -76,7 +76,8 @@ type Txn struct {
 }
 
 type DB struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex // shared by plain reads outside SERIALIZABLE, exclusive for everything else
+	txMu     sync.Mutex   // guards nextTx and active while statements share mu
 	cond     *sync.Cond
 	tables   map[string]*Table
 	indexes  map[string]string // index name -> table
@@ -253,10 +254,27 @@ func (db *DB) write(t *Txn, tb *Table, r *Row, vals []Value, dead bool) {
 }
 
 func (db *DB) begin(iso int, explicit bool) *Txn {
+	db.txMu.Lock()
+	defer db.txMu.Unlock()
 	db.nextTx++
 	t := &Txn{id: db.nextTx, start: db.ts, iso: iso, explicit: explicit, db: db}
 	db.active[t] = true
 	return t
+}
+
+// endRead ends a transaction that wrote nothing and holds no read locks, under a shared mu.
+// Cleanup of other transactions waits for the next exclusive commit.
+func (db *DB) endRead(t *Txn, state int) {
+	db.txMu.Lock()
+	defer db.txMu.Unlock()
+	if t.state != active {
+		return
+	}
+	if state == committed {
+		t.commit = db.ts
+	}
+	t.state = state
+	delete(db.active, t)
 }
 
 // commitTx makes t durable and visible. With a log, the record is queued for the log writer, which
