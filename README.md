@@ -44,7 +44,7 @@ demo=> SELECT owner, balance FROM accounts ORDER BY owner;
 | Elle list-append while the server is killed with `kill -9` 13 times | strict serializable |
 | `kill -9` at random moments, 15 rounds, a checkpoint every 16 KB of log | 48,485 acknowledged inserts and 15,992 deletes kept, bank total unchanged |
 | Simulated power cut that tears the last log write, 15 rounds | 9,749 acknowledged inserts and 3,210 deletes kept |
-| 5,000,000 rows (1 GB) with the server limited to 256 MB of memory | correct counts and sums, 186 MB peak, 1.2 GB page file |
+| 5,000,000 rows (1 GB) with the server limited to 256 MB of memory, a checkpoint every 16 MB of log | correct counts and sums, 186 MB peak; loads at 42,000 rows/s, sums the table from a cold cache in 7.8 s |
 | [sqllogictest](https://www.sqlite.org/sqllogictest), SQLite's SQL test suite | 5,675,123 of 5,675,180 (99.999%) |
 | Clients | psql, psycopg2, pgx (prepared statements, binary values, batches) |
 
@@ -54,21 +54,22 @@ Each test was also run against a deliberately broken build to make sure it notic
 
 ## Speed
 
-Measured on a 2-core VPS, with Postgres 17 (default settings) on the same disk and the same benchmark client for comparison.
+Measured on a 2-core VPS against Postgres 17 with default settings, on the same disk and with the same client. The queries run on 100,000 customers and 1,000,000 orders, with indexes on `orders.customer_id`, `orders.created` and `customers.country`, cache warm.
 
 | | isodb | Postgres 17 |
 |---|---|---|
+| Order by primary key | 0.17 ms | 0.23 ms |
+| Orders of one customer | 0.47 ms | 0.29 ms |
+| A customer joined to their orders | 0.45 ms | 0.40 ms |
+| Orders in a `created` range (1,000 rows) | 3.1 ms | 0.47 ms |
+| Latest 10 orders (`ORDER BY created DESC LIMIT 10`) | 0.17 ms | 0.22 ms |
+| `count(*)` and `sum` over all orders | 407 ms | 66 ms |
+| Revenue per country (join of both tables, `GROUP BY`) | 1,463 ms | 398 ms |
+| Top 5 customers in one country | 251 ms | 92 ms |
 | Commits per second, 10 clients | 1,238 | 1,261 |
 | Commits per second, 50 clients | 6,182 | 5,148 |
-| Point reads per second, 10 clients | 20,500 | 9,300 |
-| Bulk load | 29,000 rows per second | |
-| `count(*)` and sums over 5,000,000 rows, cold cache | 15 s | |
-| Lookup by primary key in that table | 2 ms | |
-| Lookup by primary key while another client scans 400,000 rows | 0.2 ms | |
-| Lookup by an indexed column, 200,000 rows | 0.25 ms (206 ms without the index) | |
-| Loading 20,000 rows into a table with a `UNIQUE` column | 0.3 s (63 s before unique checks used an index) | |
 
-isodb reads faster because it does much less per query: no planner, no permission checks, no system catalogs. Commits went from 416 to 1,238 per second once the log was zero-filled ahead and synced with `fdatasync`, the way Postgres does it; a sync on this disk takes 11.5 ms when the file grows and 4 ms when it does not.
+Lookups and `LIMIT` queries are close to Postgres; queries that touch many rows are 3 to 7 times slower. Commits sync the log with `fdatasync` on a file zero-filled ahead, as Postgres does; on this disk that takes 4 ms against 11.5 ms for a file that grows.
 
 ## How it works
 
@@ -76,15 +77,15 @@ isodb reads faster because it does much less per query: no planner, no permissio
 - **Recent changes**: rows written since the last checkpoint stay in memory with all their versions, on top of the B+trees. A checkpoint folds them into the page file and drops the ones every running transaction can already see.
 - **Log**: every commit is a checksummed record in a write-ahead log. Commits are queued and a background writer syncs them in batches (group commit). The log file is zero-filled a megabyte ahead so a sync only has to flush data, not a new file size; a commit returns once its record is on disk and becomes visible once every earlier commit has. Recovery opens the last checkpoint, replays the log and cuts off a torn last record.
 - **Isolation**: READ COMMITTED (the default, as in Postgres), REPEATABLE READ (snapshot isolation, first updater wins) and SERIALIZABLE (serializable snapshot isolation after [Cahill et al.](https://dl.acm.org/doi/10.1145/1620585.1620587): reads leave non-blocking markers, read-write dependencies between concurrent transactions are tracked, and a transaction that would get both an incoming and an outgoing dependency is aborted).
-- **Indexes**: one B+tree per index in the page file, keyed by the indexed values followed by the primary key, and updated by each checkpoint. Rows changed since then are found through a map in memory that lists every version they hold. A lookup reads both and rechecks each row against the transaction's snapshot, so an index never needs versions of its own.
-- **Queries**: a hand-written parser and executor. A query on one table reads it row by row and aggregates with running totals, so its memory grows with the result, not the table. A table filtered by `=` on its primary key, or on every column of an index, is read through it instead of scanned. Joins are ordered by size and use hash joins, or look a table up by primary key or index for each row driving it when those rows are few next to the table's size. Constant NULL conditions are folded the way Postgres folds them.
+- **Indexes**: one B+tree per index in the page file, keyed by the indexed values (NULL included) followed by the primary key, and updated by each checkpoint. Rows changed since then are found through a map in memory that lists every version they hold. A lookup reads both and rechecks each row against the transaction's snapshot, so an index never needs versions of its own.
+- **Queries**: a hand-written parser and executor. A query on one table reads it row by row and aggregates with running totals, so its memory grows with the result, not the table. A table filtered by `=` on its primary key or on every column of an index, or by a range on an integer index column, is read through the index; `ORDER BY` such a column with `LIMIT` reads the index in order and stops early. A join streams its biggest table past hash tables of the others, or looks a table up by primary key or index for each row driving it when those rows are few next to the table's size. Constant NULL conditions are folded the way Postgres folds them.
 
 ## Limits
 
 - Plain reads at READ COMMITTED and REPEATABLE READ run in parallel. Writes, `SELECT ... FOR UPDATE` and anything under SERIALIZABLE run one at a time behind a global lock; transactions interleave between statements.
-- A join reads each table into memory unless it can look the table up by primary key or index from a few rows of the others; only single-table queries stream.
-- Indexes are only used for `=` on every column of the index; ranges, `ORDER BY` and join conditions still scan. `CREATE INDEX` keeps the new index in memory until the next checkpoint.
-- A checkpoint pauses other statements while it writes. The page file never shrinks.
+- A join holds every table but the biggest in memory, unless it can look them up by primary key or index.
+- Ranges and `ORDER BY` use an index only on integer columns, because text keys are not stored in SQL sort order. `CREATE INDEX` keeps the new index in memory until the next checkpoint.
+- A checkpoint pauses other statements while it writes: 12 s after loading a million rows with three indexes. Rows changed since the last checkpoint stay in memory, so memory grows with `ISODB_MAXLOG` (64 MB of log by default). The page file never shrinks.
 - Types are integer, double, text and boolean. `numeric` is stored as a double, dates as text.
 - SERIALIZABLE aborts more often than Postgres, because the pivot rule is the conservative one.
 - No system catalogs (so `psql`'s `\d` does not work), no triggers, no authentication, no TLS.
