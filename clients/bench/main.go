@@ -20,8 +20,14 @@ func main() {
 	rows := flag.Int("rows", 10000, "rows in the table")
 	secs := flag.Int("secs", 10, "seconds per test")
 	setup := flag.Bool("setup", true, "create and fill the table first")
+	load := flag.Int("load", 0, "instead of benchmarking, insert this many rows into table big")
+	payload := flag.Int("payload", 200, "bytes of text per loaded row")
 	flag.Parse()
 	ctx := context.Background()
+	if *load > 0 {
+		loadRows(ctx, *url, *load, *payload)
+		return
+	}
 	if *setup {
 		c, err := pgx.Connect(ctx, *url)
 		check(err)
@@ -70,4 +76,31 @@ func check(err error) {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+func loadRows(ctx context.Context, url string, n, size int) {
+	c, err := pgx.Connect(ctx, url)
+	check(err)
+	defer c.Close(ctx)
+	_, err = c.Exec(ctx, "CREATE TABLE IF NOT EXISTS big (id INTEGER PRIMARY KEY, grp INTEGER, payload TEXT)")
+	check(err)
+	text := make([]byte, size)
+	for i := range text {
+		text[i] = 'a' + byte(i%26)
+	}
+	start := time.Now()
+	for i := 0; i < n; i += 1000 {
+		tx, err := c.Begin(ctx)
+		check(err)
+		b := &pgx.Batch{}
+		for j := i; j < i+1000 && j < n; j++ {
+			b.Queue("INSERT INTO big VALUES ($1, $2, $3)", j, j%100, string(text))
+		}
+		check(tx.SendBatch(ctx, b).Close())
+		check(tx.Commit(ctx))
+		if (i/1000)%500 == 0 {
+			fmt.Printf("%d rows, %.0f rows/s\n", i, float64(i)/time.Since(start).Seconds())
+		}
+	}
+	fmt.Printf("loaded %d rows in %s\n", n, time.Since(start).Round(time.Second))
 }
