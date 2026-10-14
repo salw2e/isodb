@@ -16,10 +16,11 @@ type colInfo struct {
 type layout struct {
 	cols   []colInfo
 	byName map[string][]int
+	found  map[*sql.Col]int // where a column reference resolved, or -1 when not in this layout
 }
 
 func newLayout(cols []colInfo) *layout {
-	l := &layout{cols: cols, byName: map[string][]int{}}
+	l := &layout{cols: cols, byName: map[string][]int{}, found: map[*sql.Col]int{}}
 	for i, c := range cols {
 		l.byName[c.name] = append(l.byName[c.name], i)
 	}
@@ -45,6 +46,12 @@ func (e *env) resolve(c *sql.Col) (*env, int, error) {
 		if x.l == nil {
 			continue
 		}
+		if idx, ok := x.l.found[c]; ok {
+			if idx >= 0 {
+				return x, idx, nil
+			}
+			continue
+		}
 		idx := -1
 		for _, i := range x.l.byName[c.Name] {
 			if c.Table != "" && x.l.cols[i].table != c.Table {
@@ -57,6 +64,7 @@ func (e *env) resolve(c *sql.Col) (*env, int, error) {
 				idx = i
 			}
 		}
+		x.l.found[c] = idx
 		if idx >= 0 {
 			return x, idx, nil
 		}
@@ -1249,6 +1257,8 @@ type acc struct {
 	err   error
 	n     int64
 	sum   Value
+	isum  int64 // sum while every value so far is an integer and it fits
+	ints  bool
 	fsum  float64
 	best  Value
 	b     Value
@@ -1263,6 +1273,12 @@ func newAccs(fns []*sql.Func) []*acc {
 		out[i] = &acc{}
 	}
 	return out
+}
+
+func (a *acc) settle() {
+	if a.ints {
+		a.sum, a.ints = a.isum, false
+	}
 }
 
 func (a *acc) add(f *sql.Func, e *env) error {
@@ -1295,6 +1311,13 @@ func (a *acc) add(f *sql.Func, e *env) error {
 				return err
 			}
 		}
+		if x, ok := v.(int64); ok && (a.sum == nil || a.ints) {
+			if s := a.isum + x; !(x > 0 && s < a.isum || x < 0 && s > a.isum) {
+				a.isum, a.ints = s, true
+				return nil
+			}
+		}
+		a.settle()
 		if a.sum == nil {
 			a.sum = int64(0)
 		}
@@ -1343,8 +1366,10 @@ func (a *acc) result(f *sql.Func, e *env) (Value, error) {
 	case "count":
 		return a.n, nil
 	case "sum":
+		a.settle()
 		return a.sum, nil
 	case "total":
+		a.settle()
 		if a.sum == nil {
 			return 0.0, nil
 		}

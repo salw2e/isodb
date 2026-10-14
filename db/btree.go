@@ -175,15 +175,21 @@ func (p *pager) decode(id pageID, b []byte) (*node, error) {
 	if b[0] != 1 && b[0] != 2 {
 		return nil, errCorrupt
 	}
+	// keys and values point into b, which nothing writes to again; the capacity limits keep an
+	// append from running into the next entry
 	cnt := int(binary.LittleEndian.Uint16(b[1:]))
 	at := 3
-	if !n.leaf {
+	n.keys = make([][]byte, 0, cnt)
+	if n.leaf {
+		n.vals, n.ovf = make([][]byte, 0, cnt), make([]pageID, 0, cnt)
+	} else {
+		n.kids = make([]pageID, 0, cnt+1)
 		n.kids = append(n.kids, pageID(binary.LittleEndian.Uint64(b[at:])))
 		at += 8
 	}
 	for i := 0; i < cnt; i++ {
 		kl := int(binary.LittleEndian.Uint16(b[at:]))
-		n.keys = append(n.keys, append([]byte(nil), b[at+2:at+2+kl]...))
+		n.keys = append(n.keys, b[at+2:at+2+kl:at+2+kl])
 		at += 2 + kl
 		if !n.leaf {
 			n.kids = append(n.kids, pageID(binary.LittleEndian.Uint64(b[at:])))
@@ -192,7 +198,7 @@ func (p *pager) decode(id pageID, b []byte) (*node, error) {
 		}
 		if b[at] == 0 {
 			vl := int(binary.LittleEndian.Uint16(b[at+1:]))
-			n.vals = append(n.vals, append([]byte(nil), b[at+3:at+3+vl]...))
+			n.vals = append(n.vals, b[at+3:at+3+vl:at+3+vl])
 			n.ovf = append(n.ovf, 0)
 			at += 3 + vl
 			continue
@@ -468,6 +474,47 @@ func (p *pager) seekIn(id pageID, k []byte, fn func(k, v []byte) bool) (bool, er
 	return true, nil
 }
 
+// seekRev calls fn for every key below k (every key when k is nil), in descending order, until it
+// returns false.
+func (p *pager) seekRev(root pageID, k []byte, fn func(k, v []byte) bool) error {
+	if root == 0 {
+		return nil
+	}
+	_, err := p.seekRevIn(root, k, fn)
+	return err
+}
+
+func (p *pager) seekRevIn(id pageID, k []byte, fn func(k, v []byte) bool) (bool, error) {
+	n, err := p.load(id)
+	if err != nil {
+		return false, err
+	}
+	if n.leaf {
+		keys, vals := n.keys, n.vals
+		i := len(keys)
+		if k != nil {
+			i = sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], k) >= 0 })
+		}
+		for i--; i >= 0; i-- {
+			if !fn(keys[i], vals[i]) {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	kids := append([]pageID(nil), n.kids...)
+	i := len(kids) - 1
+	if k != nil {
+		i = search(n, k)
+	}
+	for ; i >= 0; i-- {
+		if ok, err := p.seekRevIn(kids[i], k, fn); err != nil || !ok {
+			return ok, err
+		}
+	}
+	return true, nil
+}
+
 type piece struct {
 	sep []byte
 	id  pageID
@@ -536,6 +583,10 @@ func (p *pager) putIn(id pageID, k, v []byte) ([]piece, error) {
 }
 
 func (p *pager) replaceKid(n *node, ci int, parts []piece) {
+	if len(parts) == 1 {
+		n.kids[ci] = parts[0].id // n is writable, and nearly every insert lands here
+		return
+	}
 	kids := append(append([]pageID(nil), n.kids[:ci]...), parts[0].id)
 	keys := append([][]byte(nil), n.keys[:ci]...)
 	for _, x := range parts[1:] {

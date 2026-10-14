@@ -636,7 +636,7 @@ func (s *Session) returning(tb *Table, items []sql.SelItem, rows [][]Value, res 
 	}
 	l := newLayout(s.tableCols(tb, tb.Name))
 	sel := &sql.Select{Items: items}
-	r, err := s.project(sel, l, fromRows(rows), nil, nil, false)
+	r, err := s.project(sel, l, fromRows(rows), nil, nil, false, false)
 	if err != nil {
 		return err
 	}

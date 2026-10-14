@@ -397,6 +397,27 @@ func (r *reader) str() string {
 	return s
 }
 
+// skip passes over one value without decoding it.
+func (r *reader) skip() {
+	switch r.byte() {
+	case 1, 2:
+		if len(r.b) < 8 {
+			r.err = true
+			return
+		}
+		r.b = r.b[8:]
+	case 3:
+		n := r.uvarint()
+		if uint64(len(r.b)) < n {
+			r.err = true
+			return
+		}
+		r.b = r.b[n:]
+	case 4:
+		r.byte()
+	}
+}
+
 func (r *reader) value() Value {
 	switch r.byte() {
 	case 0:
@@ -419,3 +440,50 @@ func Text(v Value) string { return text(v) }
 
 // Coerce converts a value to a column kind: int, float, bool or text.
 func Coerce(v Value, k string) (Value, error) { return coerce(v, k) }
+
+// valueMap maps values, equal the way key makes them equal, to ints; integers and text skip
+// building a key string.
+type valueMap struct {
+	ints  map[int64]int
+	strs  map[string]int
+	other map[string]int
+}
+
+func newValueMap() *valueMap {
+	return &valueMap{ints: map[int64]int{}, strs: map[string]int{}, other: map[string]int{}}
+}
+
+func asInt(v Value) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case float64:
+		if x == math.Trunc(x) && math.Abs(x) < 1e18 {
+			return int64(x), true
+		}
+	}
+	return 0, false
+}
+
+func (m *valueMap) get(v Value) (int, bool) {
+	if n, ok := asInt(v); ok {
+		i, ok := m.ints[n]
+		return i, ok
+	}
+	if s, ok := v.(string); ok {
+		i, ok := m.strs[s]
+		return i, ok
+	}
+	i, ok := m.other[key([]Value{v})]
+	return i, ok
+}
+
+func (m *valueMap) put(v Value, i int) {
+	if n, ok := asInt(v); ok {
+		m.ints[n] = i
+	} else if s, ok := v.(string); ok {
+		m.strs[s] = i
+	} else {
+		m.other[key([]Value{v})] = i
+	}
+}

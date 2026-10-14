@@ -28,10 +28,24 @@ func encodeRow(vals []Value) []byte {
 }
 
 func decodeRow(b []byte) []Value {
+	return decodeInto(nil, b, nil)
+}
+
+// decodeInto decodes a row into buf's space when it is big enough. Columns need marks false are
+// skipped and left NULL; a nil need decodes them all.
+func decodeInto(buf []Value, b []byte, need []bool) []Value {
 	r := &reader{b: b}
 	n := r.uvarint()
-	vals := make([]Value, 0, n)
+	vals := buf[:0]
+	if uint64(cap(buf)) < n {
+		vals = make([]Value, 0, n)
+	}
 	for i := uint64(0); i < n && !r.err; i++ {
+		if need != nil && i < uint64(len(need)) && !need[i] {
+			r.skip()
+			vals = append(vals, nil)
+			continue
+		}
 		vals = append(vals, r.value())
 	}
 	if r.err {
@@ -106,6 +120,51 @@ func (db *DB) each(tb *Table, fn func(*Row) error) error {
 	return nil
 }
 
+// visible calls fn with the values of every row of tb that t can see. A row only in the page file
+// is visible to everyone as it is there, so it comes without a *Row, decoded only in the columns
+// need marks (all when nil); with reuse its values share one buffer, valid until fn returns.
+func (db *DB) visible(t *Txn, tb *Table, reuse bool, need []bool, fn func([]Value, *Row) error) error {
+	db.scan(t, tb)
+	if db.pg != nil && tb.root != 0 {
+		var buf []Value
+		var ferr error
+		err := db.pg.scan(tb.root, func(k, v []byte) bool {
+			if len(tb.rows) > 0 {
+				if _, ok := tb.rows[string(k)]; ok {
+					return true
+				}
+			}
+			vals := decodeInto(buf, v, need)
+			if reuse {
+				buf = vals
+			}
+			ferr = fn(vals, nil)
+			return ferr == nil
+		})
+		if ferr != nil {
+			return ferr
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, r := range tb.order {
+		if tb.rows[r.key] != r || len(r.vers) == 0 {
+			continue
+		}
+		vals, err := db.read(t, tb, r)
+		if err != nil {
+			return err
+		}
+		if vals != nil {
+			if err := fn(vals, r); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // trim forgets an in-memory row that holds nothing beyond what the page file has.
 func (db *DB) trim(r *Row) {
 	if db.pg == nil || r.tb == nil || len(r.readers) > 0 || db.waiting > 0 || r.tb.rows[r.key] != r {
@@ -162,6 +221,9 @@ func (db *DB) openPages(dir string) error {
 		if tb := db.tables[string(k)]; tb != nil && len(v) == 16 {
 			tb.root = pageID(binary.LittleEndian.Uint64(v))
 			tb.nextID = int64(binary.LittleEndian.Uint64(v[8:]))
+		} else if len(v) == 8 && k[1] == 'i' {
+			// an index tree from before indexes held NULLs: free it, the index is built again
+			db.dropped = append(db.dropped, pageID(binary.LittleEndian.Uint64(v)))
 		} else if len(v) == 8 {
 			roots[string(k)] = pageID(binary.LittleEndian.Uint64(v))
 		}
@@ -230,26 +292,55 @@ func (db *DB) flush() error {
 	sort.Strings(names)
 	for _, n := range names {
 		tb := db.tables[n]
-		keep := tb.order[:0]
+		// changes go into the trees in key order, which keeps each insert next to the last one
+		var changed []*Row
 		for _, r := range tb.order {
-			if tb.rows[r.key] != r {
-				continue
-			}
-			v := latestCommitted(r)
-			if v != nil && v != r.disk {
-				if err := db.flushIndexes(tb, r, v); err != nil {
-					return err
+			if tb.rows[r.key] == r {
+				if v := latestCommitted(r); v != nil && v != r.disk {
+					changed = append(changed, r)
 				}
+			}
+		}
+		sort.Slice(changed, func(i, j int) bool { return changed[i].key < changed[j].key })
+		ops := make([][]ixOp, len(tb.indexes))
+		for i, r := range changed {
+			v := latestCommitted(r)
+			ops = indexOps(tb, r, v, ops)
+			var err error
+			if v.dead {
+				tb.root, err = pg.del(tb.root, []byte(r.key))
+			} else {
+				tb.root, err = pg.put(tb.root, []byte(r.key), encodeRow(v.vals))
+			}
+			if err != nil {
+				return err
+			}
+			r.disk = v
+			// let the row go now, so memory holds it or its new page, not both
+			changed[i] = nil
+			if db.settled(r, h) {
+				delete(tb.rows, r.key)
+				db.reindex(r)
+			}
+		}
+		for i, ix := range tb.indexes {
+			sort.Slice(ops[i], func(a, b int) bool { return ops[i][a].k < ops[i][b].k })
+			for _, o := range ops[i] {
 				var err error
-				if v.dead {
-					tb.root, err = pg.del(tb.root, []byte(r.key))
+				if o.del {
+					ix.root, err = pg.del(ix.root, []byte(o.k))
 				} else {
-					tb.root, err = pg.put(tb.root, []byte(r.key), encodeRow(v.vals))
+					ix.root, err = pg.put(ix.root, []byte(o.k), nil)
 				}
 				if err != nil {
 					return err
 				}
-				r.disk = v
+			}
+		}
+		keep := tb.order[:0]
+		for _, r := range tb.order {
+			if tb.rows[r.key] != r {
+				continue
 			}
 			if db.settled(r, h) {
 				delete(tb.rows, r.key)
@@ -322,7 +413,7 @@ func (db *DB) settled(r *Row, h int64) bool {
 }
 
 func indexEntry(tb *Table, ix *Index) string {
-	return "\x00i" + tb.Name + "\x00" + ix.Name
+	return "\x00j" + tb.Name + "\x00" + ix.Name
 }
 
 func sortedKeys(m map[string][]byte) []string {
@@ -334,33 +425,32 @@ func sortedKeys(m map[string][]byte) []string {
 	return out
 }
 
-// flushIndexes moves r's index entries in the page file from the values it holds there to v's.
-func (db *DB) flushIndexes(tb *Table, r *Row, v *Version) error {
-	for _, ix := range tb.indexes {
+type ixOp struct {
+	k   string
+	del bool
+}
+
+// indexOps adds the index changes that move r's entries from the values the page file holds to
+// v's; each change is to a different entry, so they can be applied in any order.
+func indexOps(tb *Table, r *Row, v *Version, ops [][]ixOp) [][]ixOp {
+	for i, ix := range tb.indexes {
 		var old, now string
 		var oldOK, nowOK bool
 		if r.disk != nil && !r.disk.dead {
-			k, null := ix.key(r.disk.vals)
-			old, oldOK = k+r.key, !null
+			old, oldOK = ix.entry(r.disk.vals)+r.key, true
 		}
 		if !v.dead {
-			k, null := ix.key(v.vals)
-			now, nowOK = k+r.key, !null
+			now, nowOK = ix.entry(v.vals)+r.key, true
 		}
 		if oldOK == nowOK && old == now {
 			continue
 		}
-		var err error
 		if oldOK {
-			if ix.root, err = db.pg.del(ix.root, []byte(old)); err != nil {
-				return err
-			}
+			ops[i] = append(ops[i], ixOp{old, true})
 		}
 		if nowOK {
-			if ix.root, err = db.pg.put(ix.root, []byte(now), nil); err != nil {
-				return err
-			}
+			ops[i] = append(ops[i], ixOp{now, false})
 		}
 	}
-	return nil
+	return ops
 }

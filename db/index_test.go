@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +58,23 @@ func TestIndexMatchesScan(t *testing.T) {
 				t.Fatalf("a = %d, b = %s: index gave %v, scan gave %v", v, b, got, want)
 			}
 		}
+		lo := rng.Intn(6)
+		for _, q := range []string{
+			"SELECT id FROM t WHERE a BETWEEN %d AND %d ORDER BY id",
+			"SELECT id FROM t WHERE a > %d AND a <= %d ORDER BY id",
+			"SELECT id FROM t WHERE %d < a AND %d.5 > a ORDER BY id",
+			"SELECT a FROM t WHERE a >= %d OR a < %d ORDER BY a LIMIT 9",
+			"SELECT a FROM t ORDER BY a LIMIT %d OFFSET %d",
+			"SELECT a FROM t ORDER BY a DESC LIMIT %d OFFSET %d",
+			"SELECT a, count(*) FROM t WHERE a < %d OR a IS NULL GROUP BY a ORDER BY a LIMIT %d",
+		} {
+			q = fmt.Sprintf(q, lo, lo+2)
+			got := ids(t, sess, q)
+			want := ids(t, sess, strings.NewReplacer("WHERE a", "WHERE a + 0", "AND a", "AND a + 0", "> a", "> a + 0", "OR a", "OR a + 0", "ORDER BY a", "ORDER BY a + 0").Replace(q))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s: index gave %v, scan gave %v", q, got, want)
+			}
+		}
 	}
 	for step := 0; step < 3000; step++ {
 		id, a, b := rng.Intn(60), rng.Intn(6), rng.Intn(40)
@@ -64,6 +82,9 @@ func TestIndexMatchesScan(t *testing.T) {
 		switch rng.Intn(5) {
 		case 0, 1:
 			q = fmt.Sprintf("INSERT INTO t VALUES (%d, %d, 'b%d')", id, a, b)
+			if rng.Intn(8) == 0 {
+				q = fmt.Sprintf("INSERT INTO t VALUES (%d, NULL, 'b%d')", id, b)
+			}
 		case 2:
 			q = fmt.Sprintf("UPDATE t SET a = %d WHERE id = %d", a, id)
 		case 3:
@@ -179,6 +200,11 @@ func TestJoinLookupsMatchScan(t *testing.T) {
 			"SELECT c.id, sum(o.amt) FROM c JOIN o ON o.cid + 0 = c.id WHERE c.country = %d GROUP BY c.id ORDER BY 1"},
 		{"SELECT o.id, c.country FROM o, c WHERE c.id = o.cid AND o.amt = %d ORDER BY 1",
 			"SELECT o.id, c.country FROM o, c WHERE c.id + 0 = o.cid AND o.amt = %d ORDER BY 1"},
+		// a LEFT JOIN keeps FROM order and nested loops: an independent answer for inner joins
+		{"SELECT o.id, c.country FROM o JOIN c ON c.id = o.cid WHERE o.amt = %d ORDER BY 1",
+			"SELECT o.id, c.country FROM o LEFT JOIN c ON c.id = o.cid WHERE o.amt = %d AND c.id IS NOT NULL ORDER BY 1"},
+		{"SELECT c.country, count(*), sum(o.amt) FROM o JOIN c ON c.id = o.cid WHERE o.amt > %d GROUP BY c.country ORDER BY 1",
+			"SELECT c.country, count(*), sum(o.amt) FROM o LEFT JOIN c ON c.id = o.cid WHERE o.amt > %d AND c.id IS NOT NULL GROUP BY c.country ORDER BY 1"},
 	}
 	for round := 0; round < 4; round++ {
 		for _, p := range pairs {

@@ -2,13 +2,14 @@ package db
 
 import (
 	"bytes"
+	"math"
 	"sort"
 
 	"isodb/sql"
 )
 
-// An index is a B+tree in the page file with one entry per row, its index key followed by its
-// primary key, for the values the page file holds. Rows in memory are covered by mem instead: every
+// An index is a B+tree in the page file with one entry per row, its index key (NULLs included)
+// followed by its primary key, for the values the page file holds. Rows in memory are covered by mem instead: every
 // version they hold is listed under its key. A lookup reads both and rechecks each row it finds.
 type Index struct {
 	Name   string
@@ -23,8 +24,18 @@ type ixKey struct {
 	k  string
 }
 
+// key is the index key for a lookup or a uniqueness check; null reports a NULL in it.
 func (ix *Index) key(vals []Value) (string, bool) {
 	return uniqueKey(vals, ix.Cols)
+}
+
+// entry is the index key a row is stored under, NULLs included.
+func (ix *Index) entry(vals []Value) string {
+	k := make([]Value, len(ix.Cols))
+	for i, c := range ix.Cols {
+		k[i] = vals[c]
+	}
+	return key(k)
 }
 
 // reindex brings mem up to date with the versions r holds now.
@@ -39,7 +50,7 @@ func (db *DB) reindex(r *Row) {
 				if v.dead {
 					continue
 				}
-				if k, null := ix.key(v.vals); !null && !hasKey(now, ix, k) {
+				if k := ix.entry(v.vals); !hasKey(now, ix, k) {
 					now = append(now, ixKey{ix, k})
 				}
 			}
@@ -91,9 +102,7 @@ func (db *DB) build(tb *Table, ix *Index) error {
 	}
 	var perr error
 	err := db.pg.scan(tb.root, func(pk, v []byte) bool {
-		if k, null := ix.key(decodeRow(v)); !null {
-			ix.root, perr = db.pg.put(ix.root, append([]byte(k), pk...), nil)
-		}
+		ix.root, perr = db.pg.put(ix.root, append([]byte(ix.entry(decodeRow(v))), pk...), nil)
 		return perr == nil
 	})
 	if perr != nil {
@@ -157,7 +166,7 @@ func (s *Session) indexed(tb *Table, ix *Index, k string) ([][]Value, []*Row, er
 		if vals == nil {
 			continue
 		}
-		if k2, null := ix.key(vals); !null && k2 == k {
+		if ix.entry(vals) == k {
 			rows, refs = append(rows, vals), append(refs, r)
 		}
 	}
@@ -251,4 +260,274 @@ func (db *DB) estimate(tb *Table) int {
 		return n
 	}
 	return n + mult*len(nd.keys)
+}
+
+// keyLen is the length of the first n values of an encoded key (see key).
+func keyLen(b []byte, n int) int {
+	at := 0
+	for ; n > 0 && at < len(b); n-- {
+		switch b[at] {
+		case 1:
+			at += 10
+		default:
+			i := bytes.IndexByte(b[at+1:], 0xff)
+			if i < 0 {
+				return len(b)
+			}
+			at += i + 2
+		}
+	}
+	return min(at, len(b))
+}
+
+// scanIndex calls fn for every row visible to the session whose index entry lies in [lo, hi),
+// in index order, or in reverse when desc. A nil hi has no upper end.
+func (s *Session) scanIndex(tb *Table, ix *Index, lo, hi []byte, desc bool, fn func([]Value, *Row) error) error {
+	db := s.db
+	db.scan(s.tx, tb)
+	in := func(e string) bool { return e >= string(lo) && (hi == nil || e < string(hi)) }
+	type ment struct {
+		e string
+		r *Row
+	}
+	var mem []ment
+	for k, rows := range ix.mem {
+		if in(k) {
+			for r := range rows {
+				mem = append(mem, ment{k + r.key, r})
+			}
+		}
+	}
+	before := func(a, b string) bool { return a < b != desc && a != b }
+	sort.Slice(mem, func(i, j int) bool { return before(mem[i].e, mem[j].e) })
+	visit := func(r *Row, k string) error {
+		vals, err := db.read(s.tx, tb, r)
+		if err != nil || vals == nil || ix.entry(vals) != k {
+			return err
+		}
+		return fn(vals, r)
+	}
+	mi := 0
+	flush := func(upto string, all bool) error {
+		for ; mi < len(mem) && (all || before(mem[mi].e, upto)); mi++ {
+			if err := visit(mem[mi].r, mem[mi].e[:len(mem[mi].e)-len(mem[mi].r.key)]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var ferr error
+	disk := func(e, _ []byte) bool {
+		if !in(string(e)) {
+			return false
+		}
+		if ferr = flush(string(e), false); ferr != nil {
+			return false
+		}
+		n := keyLen(e, len(ix.Cols))
+		pk := string(e[n:])
+		if tb.rows[pk] != nil {
+			return true
+		}
+		r, ok := db.fromDisk(tb, pk)
+		if !ok {
+			ferr = errCorrupt
+			return false
+		}
+		r.transient = true
+		ferr = visit(r, string(e[:n]))
+		return ferr == nil
+	}
+	if db.pg != nil && ix.root != 0 {
+		var err error
+		if desc {
+			err = db.pg.seekRev(ix.root, hi, disk)
+		} else {
+			err = db.pg.seek(ix.root, lo, disk)
+		}
+		if ferr != nil {
+			return ferr
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return flush("", true)
+}
+
+// rangeScan reads one table through an index on an integer first column: the rows in a range of
+// it, or all its rows in ORDER BY order so LIMIT can stop early.
+type rangeScan struct {
+	ix      *Index
+	bounds  []bound
+	ordered bool
+	desc    bool
+}
+
+type bound struct {
+	op string // the column is on the left: col op x
+	x  sql.Expr
+}
+
+func planRange(src *source, where []sql.Expr, sel *sql.Select, order []sql.Order, l *layout, starts []int) *rangeScan {
+	tb := src.table
+	isCol := func(x sql.Expr, c int) bool {
+		col, ok := x.(*sql.Col)
+		return ok && col.Name == tb.Cols[c].Name && (col.Table == "" || col.Table == src.cols[0].table)
+	}
+	konst := func(x sql.Expr) bool {
+		refs, _ := refsOf(x, l, starts)
+		return len(refs) == 0 && !hasSubquery(x)
+	}
+	flip := map[string]string{"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+	boundsOn := func(c int) []bound {
+		var out []bound
+		for _, w := range where {
+			switch x := w.(type) {
+			case *sql.Binary:
+				if _, ok := flip[x.Op]; !ok {
+					continue
+				}
+				if isCol(x.L, c) && konst(x.R) {
+					out = append(out, bound{x.Op, x.R})
+				} else if isCol(x.R, c) && konst(x.L) {
+					out = append(out, bound{flip[x.Op], x.L})
+				}
+			case *sql.Between:
+				if !x.Not && isCol(x.X, c) && konst(x.Lo) && konst(x.Hi) {
+					out = append(out, bound{">=", x.Lo}, bound{"<=", x.Hi})
+				}
+			}
+		}
+		return out
+	}
+	// ORDER BY one column of this table with a LIMIT, and nothing grouped
+	oc := -1
+	if len(order) == 1 && sel.Limit != nil && len(sel.GroupBy) == 0 && !sel.Distinct && !hasAggregate(sel.Having) && !hasAggregate(order[0].Expr) {
+		if col, ok := order[0].Expr.(*sql.Col); ok && colIndex(tb, col.Name) >= 0 && isCol(col, colIndex(tb, col.Name)) {
+			c := colIndex(tb, col.Name)
+			oc = c
+			for _, it := range sel.Items {
+				if hasAggregate(it.Expr) {
+					oc = -1
+				}
+				if c2, ok := it.Expr.(*sql.Col); it.Alias == col.Name && (!ok || c2.Name != col.Name) {
+					oc = -1 // ORDER BY names an output column, not this one
+				}
+			}
+		}
+	}
+	var best *rangeScan
+	for _, ix := range tb.indexes {
+		c := ix.Cols[0]
+		if tb.Cols[c].Kind != "int" {
+			continue // only integer keys sort the way ORDER BY does
+		}
+		b := boundsOn(c)
+		if c == oc {
+			return &rangeScan{ix: ix, bounds: b, ordered: true, desc: order[0].Desc}
+		}
+		if len(b) > 0 && best == nil {
+			best = &rangeScan{ix: ix, bounds: b}
+		}
+	}
+	return best
+}
+
+// scanRange runs a planned range scan. It reports false, having read nothing, when a plain scan
+// is the better way: no usable bounds, or a range covering much of the table.
+func (s *Session) scanRange(tb *Table, rs *rangeScan, e *env, fn func([]Value, *Row) error) (bool, error) {
+	var lo, hi *int64
+	for _, b := range rs.bounds {
+		v, err := e.eval(b.x)
+		if err != nil {
+			return true, err
+		}
+		if v == nil {
+			return true, nil // a comparison with NULL is never true
+		}
+		var n int64
+		switch x := v.(type) {
+		case int64:
+			n = x
+		case float64:
+			if x != x || x < -9e18 || x > 9e18 {
+				continue
+			}
+			n = int64(math.Floor(x))
+		default:
+			continue
+		}
+		// bounds are widened to whole integers; the WHERE conditions still decide each row
+		switch b.op {
+		case ">", ">=":
+			if lo == nil || n > *lo {
+				lo = &n
+			}
+		case "<", "<=":
+			if n == math.MaxInt64 {
+				continue
+			}
+			m := n + 1
+			if hi == nil || m < *hi {
+				hi = &m
+			}
+		}
+	}
+	if lo == nil && hi == nil && !rs.ordered {
+		return false, nil
+	}
+	loB, hiB := []byte{1}, []byte(nil) // 1 starts the integers, after NULL (0)
+	if lo != nil {
+		loB = []byte(key([]Value{*lo}))
+	}
+	if hi != nil {
+		if lo != nil && *lo >= *hi {
+			return true, nil
+		}
+		hiB = []byte(key([]Value{*hi}))
+	}
+	if !rs.ordered {
+		limit := max(s.db.estimate(tb)/10, 100)
+		if s.db.countRange(rs.ix, loB, hiB, limit) >= limit {
+			return false, nil
+		}
+	}
+	if lo != nil || hi != nil {
+		return true, s.scanIndex(tb, rs.ix, loB, hiB, rs.desc, fn)
+	}
+	// every row in order: NULLs sort last, so they come first going down
+	nulls := func() error { return s.scanIndex(tb, rs.ix, []byte{0}, []byte{1}, rs.desc, fn) }
+	if rs.desc {
+		if err := nulls(); err != nil {
+			return true, err
+		}
+	}
+	if err := s.scanIndex(tb, rs.ix, []byte{1}, nil, rs.desc, fn); err != nil {
+		return true, err
+	}
+	if !rs.desc {
+		return true, nulls()
+	}
+	return true, nil
+}
+
+// countRange counts index entries in [lo, hi), stopping at limit.
+func (db *DB) countRange(ix *Index, lo, hi []byte, limit int) int {
+	n := 0
+	for k, rows := range ix.mem {
+		if k >= string(lo) && (hi == nil || k < string(hi)) {
+			n += len(rows)
+		}
+	}
+	if db.pg != nil && ix.root != 0 {
+		db.pg.seek(ix.root, lo, func(e, _ []byte) bool {
+			if hi != nil && string(e) >= string(hi) {
+				return false
+			}
+			n++
+			return n < limit
+		})
+	}
+	return n
 }

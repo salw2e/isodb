@@ -35,6 +35,36 @@ func check(t *testing.T, p *pager, root pageID, want map[string][]byte) {
 			t.Fatalf("get %q: ok=%v err=%v", k, ok, err)
 		}
 	}
+	var all []string
+	p.seekRev(root, nil, func(k, _ []byte) bool { all = append(all, string(k)); return true })
+	for j, k := range all {
+		if k != keys[len(keys)-1-j] {
+			t.Fatalf("seekRev from the end: key %d is %q", j, k)
+		}
+	}
+	if len(all) != len(keys) {
+		t.Fatalf("seekRev from the end found %d keys, want %d", len(all), len(keys))
+	}
+	// seek and seekRev from a few points, against the sorted keys
+	for _, from := range []string{"", "key-0", "key-01500", "key-014999", "key-02999", "key-9"} {
+		i := sort.SearchStrings(keys, from)
+		var up, down []string
+		p.seek(root, []byte(from), func(k, _ []byte) bool { up = append(up, string(k)); return len(up) < 40 })
+		p.seekRev(root, []byte(from), func(k, _ []byte) bool { down = append(down, string(k)); return len(down) < 40 })
+		for j, k := range up {
+			if keys[i+j] != k {
+				t.Fatalf("seek %q: key %d is %q, want %q", from, j, k, keys[i+j])
+			}
+		}
+		for j, k := range down {
+			if keys[i-1-j] != k {
+				t.Fatalf("seekRev %q: key %d is %q, want %q", from, j, k, keys[i-1-j])
+			}
+		}
+		if len(up) != min(40, len(keys)-i) || len(down) != min(40, i) {
+			t.Fatalf("seek %q: %d up, %d down", from, len(up), len(down))
+		}
+	}
 }
 
 func value(r *rand.Rand) []byte {
