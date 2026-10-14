@@ -385,7 +385,7 @@ func neverTrue(x sql.Expr) bool {
 		}
 		return nullConst(y.X) || nullConst(y.Lo) || nullConst(y.Hi)
 	case *sql.In:
-		return nullConst(y.X)
+		return nullConst(y.X) && (len(y.List) > 0 || y.Sub != nil)
 	case *sql.IsNull:
 		return y.Not && nullConst(y.X)
 	}
@@ -413,7 +413,7 @@ func neverFalse(x sql.Expr) bool {
 		}
 		return nullConst(y.X) || nullConst(y.Lo) && nullConst(y.Hi)
 	case *sql.In:
-		return nullConst(y.X)
+		return nullConst(y.X) && (len(y.List) > 0 || y.Sub != nil)
 	case *sql.IsNull:
 		return !y.Not && nullConst(y.X)
 	}
