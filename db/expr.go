@@ -1249,6 +1249,8 @@ type acc struct {
 	err   error
 	n     int64
 	sum   Value
+	isum  int64 // sum while every value so far is an integer and it fits
+	ints  bool
 	fsum  float64
 	best  Value
 	b     Value
@@ -1263,6 +1265,12 @@ func newAccs(fns []*sql.Func) []*acc {
 		out[i] = &acc{}
 	}
 	return out
+}
+
+func (a *acc) settle() {
+	if a.ints {
+		a.sum, a.ints = a.isum, false
+	}
 }
 
 func (a *acc) add(f *sql.Func, e *env) error {
@@ -1295,6 +1303,13 @@ func (a *acc) add(f *sql.Func, e *env) error {
 				return err
 			}
 		}
+		if x, ok := v.(int64); ok && (a.sum == nil || a.ints) {
+			if s := a.isum + x; !(x > 0 && s < a.isum || x < 0 && s > a.isum) {
+				a.isum, a.ints = s, true
+				return nil
+			}
+		}
+		a.settle()
 		if a.sum == nil {
 			a.sum = int64(0)
 		}
@@ -1343,8 +1358,10 @@ func (a *acc) result(f *sql.Func, e *env) (Value, error) {
 	case "count":
 		return a.n, nil
 	case "sum":
+		a.settle()
 		return a.sum, nil
 	case "total":
+		a.settle()
 		if a.sum == nil {
 			return 0.0, nil
 		}
