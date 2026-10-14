@@ -369,7 +369,15 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		done  bool
 	}
 	var conjs []*conj
-	for _, c := range splitAnd(sel.Where, nil) {
+	where := splitAnd(sel.Where, nil)
+	if !hasLeft {
+		// an inner join's ON is a WHERE condition that can drive hash joins and lookups
+		for _, src := range srcs {
+			where = splitAnd(src.on, where)
+			src.on = nil
+		}
+	}
+	for _, c := range where {
 		cj := &conj{x: c}
 		if hasLeft || n == 0 || hasSubquery(c) || hasAggregate(c) {
 			cj.final = true
@@ -379,30 +387,39 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		conjs = append(conjs, cj)
 	}
 
+	// eqOn finds a condition setting column name of source j equal to an expression that does not
+	// read j: a value when join is false, otherwise anything that reads other tables or not
+	eqOn := func(j int, name string, join bool) (sql.Expr, map[int]bool) {
+		src := srcs[j]
+		for _, cj := range conjs {
+			b, ok := cj.x.(*sql.Binary)
+			if cj.final || !ok || b.Op != "=" {
+				continue
+			}
+			for _, side := range [][2]sql.Expr{{b.L, b.R}, {b.R, b.L}} {
+				col, ok := side[0].(*sql.Col)
+				if !ok || col.Name != name || col.Table != "" && col.Table != src.cols[0].table || col.Table == "" && len(l.byName[col.Name]) > 1 {
+					continue
+				}
+				refs, _ := refsOf(side[1], l, starts)
+				if hasSubquery(side[1]) || refs[j] || !join && len(refs) > 0 {
+					continue
+				}
+				return side[1], refs
+			}
+		}
+		return nil, nil
+	}
+
 	// primary key or index columns equal to values that need no other table: look rows up instead
 	// of scanning
-	for _, src := range srcs {
+	for j, src := range srcs {
 		if src.table == nil || hasLeft {
 			continue
 		}
 		eq := func(name string) sql.Expr {
-			for _, cj := range conjs {
-				b, ok := cj.x.(*sql.Binary)
-				if cj.final || !ok || b.Op != "=" {
-					continue
-				}
-				for _, side := range [][2]sql.Expr{{b.L, b.R}, {b.R, b.L}} {
-					col, ok := side[0].(*sql.Col)
-					if !ok || col.Name != name || col.Table != "" && col.Table != src.cols[0].table || col.Table == "" && len(l.byName[col.Name]) > 1 {
-						continue
-					}
-					if refs, _ := refsOf(side[1], l, starts); len(refs) > 0 || hasSubquery(side[1]) {
-						continue
-					}
-					return side[1]
-				}
-			}
-			return nil
+			x, _ := eqOn(j, name, false)
+			return x
 		}
 		if len(src.table.PK) == 1 {
 			src.pk, src.pkCol = eq(src.table.Cols[src.table.PK[0]].Name), src.table.PK[0]
@@ -412,12 +429,87 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		}
 	}
 
+	// a table joined by = on its primary key or an index can instead be looked up for each row of
+	// the tables it is joined to
+	probes := make([]*probe, n)
+	if n > 1 && !hasLeft && !sel.ForUpdate {
+		for j, src := range srcs {
+			if src.table == nil || src.pk != nil || src.ix != nil {
+				continue
+			}
+			pr := &probe{deps: map[int]bool{}}
+			eq := func(name string) sql.Expr {
+				x, refs := eqOn(j, name, true)
+				for r := range refs {
+					pr.deps[r] = true
+				}
+				return x
+			}
+			if len(src.table.PK) == 1 {
+				if x := eq(src.table.Cols[src.table.PK[0]].Name); x != nil {
+					pr.xs = []sql.Expr{x}
+				}
+			}
+			if pr.xs == nil {
+				pr.deps = map[int]bool{}
+				pr.ix, pr.xs = pickIndex(src.table, eq)
+				if pr.ix != nil {
+					pr.deps = map[int]bool{}
+					for _, x := range pr.xs {
+						refs, _ := refsOf(x, l, starts)
+						for r := range refs {
+							pr.deps[r] = true
+						}
+					}
+				}
+			}
+			if pr.xs != nil && len(pr.deps) > 0 {
+				probes[j] = pr
+			}
+		}
+	}
+
 	// one table without a key lookup is read straight from storage, row by row
 	stream := n == 1 && srcs[0].table != nil && srcs[0].pk == nil && srcs[0].ix == nil && !sel.ForUpdate
 	var streamConds []sql.Expr
 
-	// load each table and filter it by the conditions that read only that table
-	for i, src := range srcs {
+	// load each table and filter it by the conditions that read only that table; a table that can
+	// be probed is left unloaded when the rows driving it are few next to its size
+	loaded := make([]bool, n)
+	loadOrder := make([]int, 0, n)
+	for i := range srcs {
+		if probes[i] == nil {
+			loadOrder = append(loadOrder, i)
+		}
+	}
+	for i := range srcs {
+		if probes[i] != nil {
+			loadOrder = append(loadOrder, i)
+		}
+	}
+	for _, i := range loadOrder {
+		src := srcs[i]
+		if pr := probes[i]; pr != nil {
+			drive := 1
+			for d := range pr.deps {
+				if !loaded[d] || probes[d] != nil && probes[d].lazy {
+					drive = -1
+					break
+				}
+				drive *= max(len(srcs[d].rows), 1)
+			}
+			pr.lazy = drive >= 0 && drive*20 <= s.db.estimate(src.table)
+		}
+		loaded[i] = true
+		if pr := probes[i]; pr != nil && pr.lazy {
+			for _, cj := range conjs {
+				if !cj.final && len(cj.refs) == 1 && cj.refs[i] {
+					pr.filter = append(pr.filter, cj.x)
+					cj.done = true
+				}
+			}
+			continue
+		}
 		if src.table != nil && !stream {
 			if src.pk != nil {
 				e.row = cur
@@ -502,6 +594,17 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				best = i
 				break
 			}
+			if pr := probes[i]; pr != nil && pr.lazy {
+				ready := true
+				for d := range pr.deps {
+					ready = ready && bound[d]
+				}
+				if ready {
+					best = i
+					break
+				}
+				continue
+			}
 			connected := len(joinOrder) == 0
 			for _, cj := range conjs {
 				if cj.done || cj.final || !cj.refs[i] {
@@ -549,6 +652,9 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 	hashes := make([]*hashJoin, n)
 	for p := 1; p < n && !hasLeft; p++ {
 		j := joinOrder[p]
+		if probes[j] != nil && probes[j].lazy {
+			continue
+		}
 		for _, c := range levels[p] {
 			b, ok := c.(*sql.Binary)
 			if !ok || b.Op != "=" {
@@ -614,8 +720,21 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 		j := joinOrder[p]
 		src := srcs[j]
 		width := len(src.cols)
+		rows, refs := src.rows, src.refs
 		var cand []int
-		if hj := hashes[p]; hj != nil {
+		conds := levels[p]
+		if pr := probes[j]; pr != nil && pr.lazy {
+			e.row = cur
+			var err error
+			if rows, refs, err = s.probeRows(src.table, pr, e); err != nil {
+				return err
+			}
+			cand = make([]int, len(rows))
+			for i := range cand {
+				cand[i] = i
+			}
+			conds = append(append([]sql.Expr(nil), pr.filter...), conds...)
+		} else if hj := hashes[p]; hj != nil {
 			e.row = cur
 			v, err := e.eval(hj.probe)
 			if err != nil {
@@ -630,16 +749,15 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				cand[i] = i
 			}
 		}
-		conds := levels[p]
 		if src.on != nil {
 			conds = append([]sql.Expr{src.on}, conds...)
 		}
 		matched := false
 		for _, ri := range cand {
-			copy(cur[starts[j]:starts[j]+width], src.rows[ri])
+			copy(cur[starts[j]:starts[j]+width], rows[ri])
 			curRefs[j] = nil
-			if src.refs != nil {
-				curRefs[j] = src.refs[ri]
+			if refs != nil {
+				curRefs[j] = refs[ri]
 			}
 			ok, err := test(conds)
 			if err != nil {

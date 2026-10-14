@@ -199,3 +199,56 @@ func lookupKey(tb *Table, ix *Index, xs []sql.Expr, e *env) (string, bool, error
 	}
 	return key(vals), true, nil
 }
+
+// probe looks a joined table up through its primary key (ix nil) or an index, once per row of
+// the tables in deps, instead of loading it whole.
+type probe struct {
+	ix     *Index
+	xs     []sql.Expr
+	deps   map[int]bool
+	lazy   bool
+	filter []sql.Expr // conditions on this table alone, applied to what a lookup finds
+}
+
+func (s *Session) probeRows(tb *Table, pr *probe, e *env) ([][]Value, []*Row, error) {
+	cols := tb.PK
+	if pr.ix != nil {
+		cols = pr.ix.Cols
+	}
+	vals := make([]Value, len(pr.xs))
+	for i, x := range pr.xs {
+		v, err := e.eval(x)
+		if err != nil || v == nil {
+			return nil, nil, err
+		}
+		if vals[i], err = coerce(v, tb.Cols[cols[i]].Kind); err != nil {
+			return nil, nil, nil // a value of another type matches no key; the join condition still decides
+		}
+	}
+	if pr.ix != nil {
+		return s.indexed(tb, pr.ix, key(vals))
+	}
+	row, r, err := s.lookup(tb, key(vals))
+	if err != nil || row == nil {
+		return nil, nil, err
+	}
+	return [][]Value{row}, []*Row{r}, nil
+}
+
+// estimate guesses how many rows tb has from the leftmost path down its tree.
+func (db *DB) estimate(tb *Table) int {
+	n := len(tb.rows)
+	if db.pg == nil || tb.root == 0 {
+		return n
+	}
+	mult := 1
+	nd, err := db.pg.load(tb.root)
+	for err == nil && !nd.leaf {
+		mult *= len(nd.kids)
+		nd, err = db.pg.load(nd.kids[0])
+	}
+	if err != nil {
+		return n
+	}
+	return n + mult*len(nd.keys)
+}
