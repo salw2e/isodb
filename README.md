@@ -54,22 +54,25 @@ Each test was also run against a deliberately broken build to make sure it notic
 
 ## Speed
 
-Measured on a 2-core VPS whose disk takes 12 ms per sync.
+Measured on a 2-core VPS, with Postgres 17 (default settings) on the same disk and the same benchmark client for comparison.
 
-| | |
-|---|---|
-| Commits per second, 10 clients | 413 (84 before group commit) |
-| Commits per second, 50 clients | 2,096 |
-| Point reads per second, 10 clients | 22,400 |
-| Bulk load | 29,000 rows per second |
-| `count(*)` and sums over 5,000,000 rows, cold cache | 15 s |
-| Lookup by primary key in that table | 2 ms |
+| | isodb | Postgres 17 |
+|---|---|---|
+| Commits per second, 10 clients | 1,238 | 1,261 |
+| Commits per second, 50 clients | 6,182 | 5,148 |
+| Point reads per second, 10 clients | 20,500 | 9,300 |
+| Bulk load | 29,000 rows per second | |
+| `count(*)` and sums over 5,000,000 rows, cold cache | 15 s | |
+| Lookup by primary key in that table | 2 ms | |
+| Lookup by primary key while another client scans 400,000 rows | 0.2 ms | |
+
+isodb reads faster because it does much less per query: no planner, no permission checks, no system catalogs. Commits went from 416 to 1,238 per second once the log was zero-filled ahead and synced with `fdatasync`, the way Postgres does it; a sync on this disk takes 11.5 ms when the file grows and 4 ms when it does not.
 
 ## How it works
 
 - **Storage**: one B+tree per table in a page file. A checkpoint writes every page it changes to a new place, syncs, then writes one of two alternating meta pages, so a crash during a checkpoint leaves the previous one intact. Pages a checkpoint stops using are reused by the next one. A fixed-size page cache keeps memory bounded.
 - **Recent changes**: rows written since the last checkpoint stay in memory with all their versions, on top of the B+trees. A checkpoint folds them into the page file and drops the ones every running transaction can already see.
-- **Log**: every commit is a checksummed record in a write-ahead log. Commits are queued and a background writer syncs them in batches (group commit); a commit returns once its record is on disk and becomes visible once every earlier commit has. Recovery opens the last checkpoint, replays the log and cuts off a torn last record.
+- **Log**: every commit is a checksummed record in a write-ahead log. Commits are queued and a background writer syncs them in batches (group commit). The log file is zero-filled a megabyte ahead so a sync only has to flush data, not a new file size; a commit returns once its record is on disk and becomes visible once every earlier commit has. Recovery opens the last checkpoint, replays the log and cuts off a torn last record.
 - **Isolation**: READ COMMITTED (the default, as in Postgres), REPEATABLE READ (snapshot isolation, first updater wins) and SERIALIZABLE (serializable snapshot isolation after [Cahill et al.](https://dl.acm.org/doi/10.1145/1620585.1620587): reads leave non-blocking markers, read-write dependencies between concurrent transactions are tracked, and a transaction that would get both an incoming and an outgoing dependency is aborted).
 - **Queries**: a hand-written parser and executor. A query on one table reads it row by row and aggregates with running totals, so its memory grows with the result, not the table. Joins are ordered by size and use hash joins and primary key lookups. Constant NULL conditions are folded the way Postgres folds them.
 
