@@ -38,20 +38,18 @@ func (s *Session) visibleRows(tb *Table) ([][]Value, []*Row, error) {
 	db.scan(s.tx, tb)
 	var rows [][]Value
 	var refs []*Row
-	for _, r := range tb.order {
-		if len(r.vers) == 0 {
-			continue
-		}
+	err := db.each(tb, func(r *Row) error {
 		vals, err := db.read(s.tx, tb, r)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		if vals != nil {
 			rows = append(rows, vals)
 			refs = append(refs, r)
 		}
-	}
-	return rows, refs, nil
+		return nil
+	})
+	return rows, refs, err
 }
 
 func (s *Session) lookup(tb *Table, k string) ([]Value, *Row, error) {
@@ -625,7 +623,7 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 				if r == nil || srcs[i].table == nil {
 					continue
 				}
-				if err := s.db.lock(s.tx, srcs[i].table, r); err != nil {
+				if err := s.db.lock(s.tx, srcs[i].table, s.db.own(srcs[i].table, r)); err != nil {
 					return nil, err
 				}
 			}
