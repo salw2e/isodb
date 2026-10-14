@@ -200,6 +200,11 @@ func TestJoinLookupsMatchScan(t *testing.T) {
 			"SELECT c.id, sum(o.amt) FROM c JOIN o ON o.cid + 0 = c.id WHERE c.country = %d GROUP BY c.id ORDER BY 1"},
 		{"SELECT o.id, c.country FROM o, c WHERE c.id = o.cid AND o.amt = %d ORDER BY 1",
 			"SELECT o.id, c.country FROM o, c WHERE c.id + 0 = o.cid AND o.amt = %d ORDER BY 1"},
+		// a LEFT JOIN keeps FROM order and nested loops: an independent answer for inner joins
+		{"SELECT o.id, c.country FROM o JOIN c ON c.id = o.cid WHERE o.amt = %d ORDER BY 1",
+			"SELECT o.id, c.country FROM o LEFT JOIN c ON c.id = o.cid WHERE o.amt = %d AND c.id IS NOT NULL ORDER BY 1"},
+		{"SELECT c.country, count(*), sum(o.amt) FROM o JOIN c ON c.id = o.cid WHERE o.amt > %d GROUP BY c.country ORDER BY 1",
+			"SELECT c.country, count(*), sum(o.amt) FROM o LEFT JOIN c ON c.id = o.cid WHERE o.amt > %d AND c.id IS NOT NULL GROUP BY c.country ORDER BY 1"},
 	}
 	for round := 0; round < 4; round++ {
 		for _, p := range pairs {
