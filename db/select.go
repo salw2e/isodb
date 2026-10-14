@@ -801,8 +801,8 @@ func (s *Session) project(sel *sql.Select, l *layout, produce func(func([]Value)
 				keys = append(keys, k)
 			}
 			for i, f := range fns {
-				if err := g.accs[i].add(f, e); err != nil {
-					return err
+				if a := g.accs[i]; a.err == nil {
+					a.err = a.add(f, e)
 				}
 			}
 			return nil

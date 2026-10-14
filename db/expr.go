@@ -191,13 +191,31 @@ func (e *env) eval(x sql.Expr) (Value, error) {
 				list = append(list, r[0])
 			}
 		} else {
+			// like Postgres: x = a OR x = b ..., stopping at the first match
+			if len(x.List) == 0 {
+				return x.Not, nil
+			}
+			if v == nil {
+				return nil, nil
+			}
+			var r Value = false
 			for _, it := range x.List {
 				w, err := e.eval(it)
 				if err != nil {
 					return nil, err
 				}
-				list = append(list, w)
+				eq, err := cmpOp("=", v, w)
+				if err != nil {
+					return nil, err
+				}
+				if r = or3(r, eq); r == true {
+					break
+				}
 			}
+			if x.Not {
+				return not3(r), nil
+			}
+			return r, nil
 		}
 		if len(list) == 0 {
 			return x.Not, nil
@@ -385,6 +403,14 @@ func neverTrue(x sql.Expr) bool {
 		}
 		return nullConst(y.X) || nullConst(y.Lo) || nullConst(y.Hi)
 	case *sql.In:
+		if y.Not {
+			// x NOT IN (..., NULL) is ... AND x <> NULL, which is never true
+			for _, it := range y.List {
+				if nullConst(it) {
+					return true
+				}
+			}
+		}
 		return nullConst(y.X) && (len(y.List) > 0 || y.Sub != nil)
 	case *sql.IsNull:
 		return y.Not && nullConst(y.X)
@@ -654,6 +680,9 @@ func (e *env) call(f *sql.Func) (Value, error) {
 	if aggregates[f.Name] {
 		if e.aggs != nil {
 			if v, ok := e.aggs[f]; ok {
+				if ae, bad := v.(aggError); bad {
+					return nil, ae.err
+				}
 				return v, nil
 			}
 		}
@@ -1212,8 +1241,12 @@ func aggregateCalls(items []sql.SelItem, having sql.Expr, order []sql.Order) []*
 	return out
 }
 
+// aggError is an aggregate that failed; the query only fails if it uses the result.
+type aggError struct{ err error }
+
 // acc is the running state of one aggregate call for one group.
 type acc struct {
+	err   error
 	n     int64
 	sum   Value
 	fsum  float64
@@ -1303,6 +1336,9 @@ func (a *acc) add(f *sql.Func, e *env) error {
 }
 
 func (a *acc) result(f *sql.Func, e *env) (Value, error) {
+	if a.err != nil {
+		return aggError{a.err}, nil
+	}
 	switch f.Name {
 	case "count":
 		return a.n, nil
