@@ -16,10 +16,11 @@ type colInfo struct {
 type layout struct {
 	cols   []colInfo
 	byName map[string][]int
+	found  map[*sql.Col]int // where a column reference resolved, or -1 when not in this layout
 }
 
 func newLayout(cols []colInfo) *layout {
-	l := &layout{cols: cols, byName: map[string][]int{}}
+	l := &layout{cols: cols, byName: map[string][]int{}, found: map[*sql.Col]int{}}
 	for i, c := range cols {
 		l.byName[c.name] = append(l.byName[c.name], i)
 	}
@@ -45,6 +46,12 @@ func (e *env) resolve(c *sql.Col) (*env, int, error) {
 		if x.l == nil {
 			continue
 		}
+		if idx, ok := x.l.found[c]; ok {
+			if idx >= 0 {
+				return x, idx, nil
+			}
+			continue
+		}
 		idx := -1
 		for _, i := range x.l.byName[c.Name] {
 			if c.Table != "" && x.l.cols[i].table != c.Table {
@@ -57,6 +64,7 @@ func (e *env) resolve(c *sql.Col) (*env, int, error) {
 				idx = i
 			}
 		}
+		x.l.found[c] = idx
 		if idx >= 0 {
 			return x, idx, nil
 		}
