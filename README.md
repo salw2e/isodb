@@ -75,7 +75,7 @@ Measured on a 2-core VPS whose disk takes 12 ms per sync.
 
 ## Limits
 
-- Statements run one at a time behind a global lock; transactions interleave between statements.
+- Plain reads at READ COMMITTED and REPEATABLE READ run in parallel. Writes, `SELECT ... FOR UPDATE` and anything under SERIALIZABLE run one at a time behind a global lock; transactions interleave between statements.
 - A query that joins tables reads all of them into memory; only single-table queries stream.
 - Only primary keys are indexed. `CREATE INDEX` is accepted and enforces `UNIQUE`, but queries scan.
 - A checkpoint pauses other statements while it writes. The page file never shrinks.
