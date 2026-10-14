@@ -303,7 +303,7 @@ func (db *DB) flush() error {
 		}
 		sort.Slice(changed, func(i, j int) bool { return changed[i].key < changed[j].key })
 		ops := make([][]ixOp, len(tb.indexes))
-		for _, r := range changed {
+		for i, r := range changed {
 			v := latestCommitted(r)
 			ops = indexOps(tb, r, v, ops)
 			var err error
@@ -316,6 +316,12 @@ func (db *DB) flush() error {
 				return err
 			}
 			r.disk = v
+			// let the row go now, so memory holds it or its new page, not both
+			changed[i] = nil
+			if db.settled(r, h) {
+				delete(tb.rows, r.key)
+				db.reindex(r)
+			}
 		}
 		for i, ix := range tb.indexes {
 			sort.Slice(ops[i], func(a, b int) bool { return ops[i][a].k < ops[i][b].k })
