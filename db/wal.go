@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 
 	"isodb/sql"
 )
@@ -29,13 +30,22 @@ type wal struct {
 	f     *os.File
 	size  int64
 	fault float64
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	buf     []byte // records waiting for the log writer
+	queued  int64  // bytes ever queued
+	flushed int64  // bytes ever written and synced
+	stop    bool
+	done    chan struct{}
 }
 
 func openWAL(db *DB, dir string) (*wal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	w := &wal{db: db, dir: dir}
+	w := &wal{db: db, dir: dir, done: make(chan struct{})}
+	w.cond = sync.NewCond(&w.mu)
 	if s := os.Getenv("ISODB_FAULT"); s != "" {
 		w.fault, _ = strconv.ParseFloat(s, 64)
 	}
@@ -81,6 +91,8 @@ func openWAL(db *DB, dir string) (*wal, error) {
 			return nil, err
 		}
 	}
+	db.nextTS = db.ts
+	go w.writer()
 	return w, nil
 }
 
@@ -175,30 +187,80 @@ func frame(p []byte) []byte {
 	return append(out, p...)
 }
 
-func (w *wal) append(rec []byte) error {
-	if w.fault > 0 && rand.Float64() < w.fault {
-		// simulated power cut: only part of the record reaches the disk
-		w.f.Write(rec[:rand.Intn(len(rec))])
-		w.f.Sync()
-		os.Exit(137)
+// enqueue adds a record for the log writer and returns the log position just after it.
+func (w *wal) enqueue(rec []byte) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, rec...)
+	w.queued += int64(len(rec))
+	w.cond.Signal()
+	return w.queued
+}
+
+// writer writes and syncs whatever is queued, then publishes the commits it made durable.
+// Commits that arrive during a sync share the next one.
+func (w *wal) writer() {
+	defer close(w.done)
+	for {
+		w.mu.Lock()
+		for len(w.buf) == 0 && !w.stop {
+			w.cond.Wait()
+		}
+		if len(w.buf) == 0 {
+			w.mu.Unlock()
+			return
+		}
+		b, end := w.buf, w.queued
+		w.buf = nil
+		w.mu.Unlock()
+
+		if w.fault > 0 && rand.Float64() < w.fault {
+			// simulated power cut: only part of the batch reaches the disk
+			w.f.Write(b[:rand.Intn(len(b))])
+			w.f.Sync()
+			os.Exit(137)
+		}
+		if _, err := w.f.Write(b); err != nil {
+			fatal(err)
+		}
+		if err := w.f.Sync(); err != nil {
+			fatal(err)
+		}
+		db := w.db
+		db.mu.Lock()
+		w.mu.Lock()
+		w.flushed = end
+		w.size += int64(len(b))
+		w.mu.Unlock()
+		db.publish(end)
+		if w.size > maxLog {
+			if err := w.checkpoint(db); err != nil {
+				fatal(err)
+			}
+		}
+		db.mu.Unlock()
 	}
-	if _, err := w.f.Write(rec); err != nil {
-		return err
-	}
-	if err := w.f.Sync(); err != nil {
-		return err
-	}
-	w.size += int64(len(rec))
-	return nil
+}
+
+// a log write that fails leaves the log in an unknown state, so stop like Postgres does
+func fatal(err error) {
+	fmt.Fprintln(os.Stderr, "isodb: log write failed:", err)
+	os.Exit(1)
 }
 
 func (w *wal) ddl(db *DB, text string) error {
-	db.ts++
+	db.nextTS++
+	t := &Txn{commit: db.nextTS, state: committing}
 	p := []byte{'D'}
-	p = binary.LittleEndian.AppendUint64(p, uint64(db.ts))
+	p = binary.LittleEndian.AppendUint64(p, uint64(t.commit))
 	p = binary.AppendUvarint(p, uint64(len(text)))
 	p = append(p, text...)
-	return w.append(frame(p))
+	t.lsn = w.enqueue(frame(p))
+	db.pending = append(db.pending, t)
+	for t.state != committed {
+		db.cond.Wait()
+	}
+	return nil
 }
 
 func commitRecord(ts int64, rows []*Row, counters map[*Table]bool, val func(*Row) *Version) []byte {
@@ -235,27 +297,20 @@ func commitRecord(ts int64, rows []*Row, counters map[*Table]bool, val func(*Row
 	return frame(p)
 }
 
-func (w *wal) commit(db *DB, t *Txn, ts int64) error {
+func (w *wal) commitRecord(db *DB, t *Txn) []byte {
 	var rows []*Row
 	for _, r := range t.writes {
 		if db.tables[r.tb.Name] == r.tb {
 			rows = append(rows, r)
 		}
 	}
-	rec := commitRecord(ts, rows, t.serials, func(r *Row) *Version {
+	return commitRecord(t.commit, rows, t.serials, func(r *Row) *Version {
 		v := r.vers[len(r.vers)-1]
 		if v.tx != t {
 			return nil
 		}
 		return v
 	})
-	if err := w.append(rec); err != nil {
-		return err
-	}
-	if w.size > maxLog {
-		return w.checkpoint(db)
-	}
-	return nil
 }
 
 // checkpoint writes every table and its committed rows to a new snapshot, then empties the log.
@@ -333,7 +388,15 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// close lets the writer finish what is queued, then writes a final snapshot.
 func (w *wal) close() error {
+	w.mu.Lock()
+	w.stop = true
+	w.cond.Signal()
+	w.mu.Unlock()
+	<-w.done
+	w.db.mu.Lock()
+	defer w.db.mu.Unlock()
 	if err := w.checkpoint(w.db); err != nil {
 		return err
 	}
