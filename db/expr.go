@@ -569,6 +569,15 @@ func (e *env) call(f *sql.Func) (Value, error) {
 		}
 		return e.aggregate(f)
 	}
+	if f.Name == "coalesce" || f.Name == "ifnull" {
+		for _, a := range f.Args {
+			v, err := e.eval(a)
+			if err != nil || v != nil {
+				return v, err
+			}
+		}
+		return nil, nil
+	}
 	args := make([]Value, len(f.Args))
 	for i, a := range f.Args {
 		v, err := e.eval(a)

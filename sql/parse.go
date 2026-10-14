@@ -1013,12 +1013,10 @@ func (p *parser) selItems() ([]SelItem, error) {
 }
 
 func (p *parser) fromList() ([]TableRef, error) {
-	var out []TableRef
-	t, err := p.tableRef()
+	out, err := p.tableRefs()
 	if err != nil {
 		return nil, err
 	}
-	out = append(out, t)
 	for {
 		join := ""
 		switch {
@@ -1033,21 +1031,62 @@ func (p *parser) fromList() ([]TableRef, error) {
 		default:
 			return out, nil
 		}
-		t, err := p.tableRef()
+		ts, err := p.tableRefs()
 		if err != nil {
 			return nil, err
 		}
+		t := &ts[0]
 		t.Join = join
 		if join == "inner" || join == "left" {
 			if err := p.expectKw("on"); err != nil {
 				return nil, err
 			}
-			if t.On, err = p.expr(); err != nil {
+			on, err := p.expr()
+			if err != nil {
 				return nil, err
 			}
+			if len(ts) > 1 {
+				// ON for a parenthesized join applies once all of its tables are joined
+				last := &ts[len(ts)-1]
+				last.On = andExpr(last.On, on)
+				if last.Join == "" || last.Join == "," || last.Join == "cross" {
+					last.Join = "inner"
+				}
+			} else {
+				t.On = on
+			}
 		}
-		out = append(out, t)
+		out = append(out, ts...)
 	}
+}
+
+func andExpr(a, b Expr) Expr {
+	if a == nil {
+		return b
+	}
+	return &Binary{"and", a, b}
+}
+
+// tableRefs reads one FROM item; a parenthesized join "(a JOIN b ON ...)" becomes its tables.
+func (p *parser) tableRefs() ([]TableRef, error) {
+	if p.peek().kind == 'o' && p.peek().s == "(" && !(p.peekN(1).kind == 'i' && (p.peekN(1).s == "select" || p.peekN(1).s == "values")) && !(p.peekN(1).kind == 'o' && p.peekN(1).s == "(") {
+		p.p++
+		ts, err := p.fromList()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		for _, t := range ts {
+			if t.Join == "left" {
+				return nil, &Error{"LEFT JOIN inside parentheses is not supported"}
+			}
+		}
+		return ts, nil
+	}
+	t, err := p.tableRef()
+	return []TableRef{t}, err
 }
 
 func (p *parser) tableRef() (TableRef, error) {

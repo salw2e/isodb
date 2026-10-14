@@ -714,7 +714,10 @@ func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env
 			var kv []Value
 			for _, g := range sel.GroupBy {
 				if pos := outputPos(g, res.cols); pos >= 0 {
-					g = items[pos].Expr
+					// GROUP BY prefers an input column over an output alias of the same name
+					if c, ok := g.(*sql.Col); !ok || len(l.byName[c.Name]) == 0 {
+						g = items[pos].Expr
+					}
 				}
 				v, err := e.eval(g)
 				if err != nil {

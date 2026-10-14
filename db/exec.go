@@ -919,13 +919,23 @@ func (s *Session) describe(sel *sql.Select) ([]string, []string, error) {
 			}
 			continue
 		}
-		tb, err := s.db.table(tr.Name)
-		if err != nil {
-			return nil, nil, err
-		}
 		alias := tr.Alias
 		if alias == "" {
 			alias = tr.Name
+		}
+		if v := s.db.views[tr.Name]; v != nil && s.db.tables[tr.Name] == nil {
+			names, kinds, err := s.describe(v)
+			if err != nil {
+				return nil, nil, err
+			}
+			for i, n := range names {
+				all = append(all, colInfo{alias, n, kinds[i]})
+			}
+			continue
+		}
+		tb, err := s.db.table(tr.Name)
+		if err != nil {
+			return nil, nil, err
 		}
 		all = append(all, s.tableCols(tb, alias)...)
 	}
