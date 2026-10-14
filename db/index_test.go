@@ -199,3 +199,24 @@ func TestJoinLookupsMatchScan(t *testing.T) {
 		}
 	}
 }
+
+// An inner join's ON used to be checked on its own table even when the planner put that table
+// first, before the other table had a row, so a smaller ON table gave no rows at all.
+func TestJoinOnSmallerTable(t *testing.T) {
+	db, _ := Open("")
+	s := db.NewSession("t")
+	for _, q := range []string{
+		"CREATE TABLE a (id integer PRIMARY KEY)",
+		"CREATE TABLE b (id integer PRIMARY KEY, aid integer)",
+		"INSERT INTO a VALUES (1), (2)",
+		"INSERT INTO b VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)",
+	} {
+		if _, err := run(s, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := run(s, "SELECT count(*) FROM b JOIN a ON a.id = b.aid")
+	if err != nil || res.Rows[0][0] != int64(4) {
+		t.Fatalf("got %v %v, want 4", res, err)
+	}
+}
