@@ -1,7 +1,7 @@
 #!/bin/sh
 # list-append under SERIALIZABLE while the server is killed with SIGKILL and restarted, then Elle
 cd "$(dirname "$0")/.."
-dir=/tmp/isodb-ellecrash; port=15438; out=${1:-/tmp/isodb-ellecrash.edn}
+dir=${DIR:-/tmp/isodb-ellecrash}; port=15438; out=${1:-/tmp/isodb-ellecrash.edn}
 rm -rf $dir
 ./isodb -listen 127.0.0.1:$port -data $dir > /dev/null 2>&1 & pid=$!
 sleep 0.5
