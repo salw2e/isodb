@@ -292,26 +292,49 @@ func (db *DB) flush() error {
 	sort.Strings(names)
 	for _, n := range names {
 		tb := db.tables[n]
-		keep := tb.order[:0]
+		// changes go into the trees in key order, which keeps each insert next to the last one
+		var changed []*Row
 		for _, r := range tb.order {
-			if tb.rows[r.key] != r {
-				continue
-			}
-			v := latestCommitted(r)
-			if v != nil && v != r.disk {
-				if err := db.flushIndexes(tb, r, v); err != nil {
-					return err
+			if tb.rows[r.key] == r {
+				if v := latestCommitted(r); v != nil && v != r.disk {
+					changed = append(changed, r)
 				}
+			}
+		}
+		sort.Slice(changed, func(i, j int) bool { return changed[i].key < changed[j].key })
+		ops := make([][]ixOp, len(tb.indexes))
+		for _, r := range changed {
+			v := latestCommitted(r)
+			ops = indexOps(tb, r, v, ops)
+			var err error
+			if v.dead {
+				tb.root, err = pg.del(tb.root, []byte(r.key))
+			} else {
+				tb.root, err = pg.put(tb.root, []byte(r.key), encodeRow(v.vals))
+			}
+			if err != nil {
+				return err
+			}
+			r.disk = v
+		}
+		for i, ix := range tb.indexes {
+			sort.Slice(ops[i], func(a, b int) bool { return ops[i][a].k < ops[i][b].k })
+			for _, o := range ops[i] {
 				var err error
-				if v.dead {
-					tb.root, err = pg.del(tb.root, []byte(r.key))
+				if o.del {
+					ix.root, err = pg.del(ix.root, []byte(o.k))
 				} else {
-					tb.root, err = pg.put(tb.root, []byte(r.key), encodeRow(v.vals))
+					ix.root, err = pg.put(ix.root, []byte(o.k), nil)
 				}
 				if err != nil {
 					return err
 				}
-				r.disk = v
+			}
+		}
+		keep := tb.order[:0]
+		for _, r := range tb.order {
+			if tb.rows[r.key] != r {
+				continue
 			}
 			if db.settled(r, h) {
 				delete(tb.rows, r.key)
@@ -396,9 +419,15 @@ func sortedKeys(m map[string][]byte) []string {
 	return out
 }
 
-// flushIndexes moves r's index entries in the page file from the values it holds there to v's.
-func (db *DB) flushIndexes(tb *Table, r *Row, v *Version) error {
-	for _, ix := range tb.indexes {
+type ixOp struct {
+	k   string
+	del bool
+}
+
+// indexOps adds the index changes that move r's entries from the values the page file holds to
+// v's; each change is to a different entry, so they can be applied in any order.
+func indexOps(tb *Table, r *Row, v *Version, ops [][]ixOp) [][]ixOp {
+	for i, ix := range tb.indexes {
 		var old, now string
 		var oldOK, nowOK bool
 		if r.disk != nil && !r.disk.dead {
@@ -410,17 +439,12 @@ func (db *DB) flushIndexes(tb *Table, r *Row, v *Version) error {
 		if oldOK == nowOK && old == now {
 			continue
 		}
-		var err error
 		if oldOK {
-			if ix.root, err = db.pg.del(ix.root, []byte(old)); err != nil {
-				return err
-			}
+			ops[i] = append(ops[i], ixOp{old, true})
 		}
 		if nowOK {
-			if ix.root, err = db.pg.put(ix.root, []byte(now), nil); err != nil {
-				return err
-			}
+			ops[i] = append(ops[i], ixOp{now, false})
 		}
 	}
-	return nil
+	return ops
 }
