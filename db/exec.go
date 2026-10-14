@@ -61,8 +61,6 @@ func Open(dir string) (*DB, error) {
 }
 
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.wal != nil {
 		return db.wal.close()
 	}
@@ -479,7 +477,7 @@ func (s *Session) checkUnique(tb *Table, self *Row, vals []Value) error {
 			}
 			v := r.vers[len(r.vers)-1]
 			if v.tx != s.tx && v.tx.state != committed {
-				if v.tx.state == active {
+				if v.tx.state == active || v.tx.state == committing {
 					if err := s.db.lock(s.tx, tb, r); err != nil {
 						return err
 					}

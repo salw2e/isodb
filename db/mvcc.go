@@ -16,6 +16,7 @@ const (
 	active = iota
 	committed
 	aborted
+	committing // its log record is queued but not yet on disk
 )
 
 type Column struct {
@@ -66,6 +67,7 @@ type Txn struct {
 	readRows   []*Row
 	readTables []*Table
 	waitFor    *Txn
+	lsn        int64
 	serials    map[*Table]bool
 	db         *DB
 }
@@ -78,7 +80,9 @@ type DB struct {
 	indexText map[string]string
 	views     map[string]*sql.Select
 	viewText  map[string]string
-	ts       int64
+	ts       int64 // every commit up to ts is durable and visible
+	nextTS   int64 // last timestamp handed out
+	pending  []*Txn
 	nextTx   int64
 	active   map[*Txn]bool
 	retained []*Txn
@@ -179,7 +183,7 @@ func (db *DB) lock(t *Txn, tb *Table, r *Row) error {
 		if w == t || w.state == aborted {
 			break
 		}
-		if w.state == active {
+		if w.state == active || w.state == committing {
 			for x := w; x != nil; x = x.waitFor {
 				if x == t {
 					return errf(codeDeadlock, "deadlock detected")
@@ -257,23 +261,35 @@ func (db *DB) begin(iso int, explicit bool) *Txn {
 	return t
 }
 
+// commitTx makes t durable and visible. With a log, the record is queued for the log writer, which
+// syncs many queued commits at once (group commit); the commit returns once the record is on disk
+// and every earlier commit is too.
 func (db *DB) commitTx(t *Txn) error {
 	if t.state != active {
 		return nil
 	}
-	if len(t.writes) > 0 || len(t.serials) > 0 {
-		ts := db.ts + 1
-		if db.wal != nil && !db.recovering {
-			if err := db.wal.commit(db, t, ts); err != nil {
-				db.abortTx(t)
-				return err
-			}
-		}
-		db.ts = ts
-		t.commit = ts
-	} else {
+	if len(t.writes) == 0 && len(t.serials) == 0 {
 		t.commit = db.ts
+		db.finish(t)
+		return nil
 	}
+	db.nextTS++
+	t.commit = db.nextTS
+	if db.wal == nil || db.recovering {
+		db.ts = t.commit
+		db.finish(t)
+		return nil
+	}
+	t.lsn = db.wal.enqueue(db.wal.commitRecord(db, t))
+	t.state = committing
+	db.pending = append(db.pending, t)
+	for t.state != committed {
+		db.cond.Wait()
+	}
+	return nil
+}
+
+func (db *DB) finish(t *Txn) {
 	t.state = committed
 	delete(db.active, t)
 	if len(t.readRows) > 0 || len(t.readTables) > 0 {
@@ -281,7 +297,18 @@ func (db *DB) commitTx(t *Txn) error {
 	}
 	db.cleanup(t)
 	db.cond.Broadcast()
-	return nil
+}
+
+// publish marks every queued commit whose record is on disk as committed, in timestamp order.
+func (db *DB) publish(flushed int64) {
+	i := 0
+	for ; i < len(db.pending) && db.pending[i].lsn <= flushed; i++ {
+		t := db.pending[i]
+		db.ts = t.commit
+		db.finish(t)
+	}
+	db.pending = db.pending[i:]
+	db.cond.Broadcast()
 }
 
 func (db *DB) abortTx(t *Txn) {
