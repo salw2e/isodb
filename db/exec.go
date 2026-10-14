@@ -126,8 +126,14 @@ func isoLevel(s string) int {
 // Run executes one parsed statement. text is its source, kept for schema changes in the log.
 func (s *Session) Run(st sql.Stmt, text string, params []Value) (*Result, error) {
 	db := s.db
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	shared := s.shareable(st)
+	if shared {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+	} else {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+	}
 	s.params = params
 	s.subs, s.corr = nil, nil
 
@@ -210,6 +216,18 @@ func (s *Session) Run(st sql.Stmt, text string, params []Value) (*Result, error)
 		t.start = db.ts
 	}
 	res, err := s.exec(st)
+	if shared {
+		if err != nil {
+			db.endRead(t, aborted)
+			s.failed = !implicit
+		} else if implicit {
+			db.endRead(t, committed)
+		}
+		if implicit {
+			s.tx = nil
+		}
+		return res, err
+	}
 	if implicit {
 		s.tx = nil
 		if err != nil {
@@ -226,6 +244,27 @@ func (s *Session) Run(st sql.Stmt, text string, params []Value) (*Result, error)
 		s.failed = true
 	}
 	return res, err
+}
+
+// shareable reports a plain SELECT that can run alongside other reads: no row locks, no
+// SERIALIZABLE read markers, and a transaction with nothing written to undo.
+func (s *Session) shareable(st sql.Stmt) bool {
+	sel, ok := st.(*sql.Select)
+	if !ok || s.failed {
+		return false
+	}
+	for x := sel; x != nil; x = x.Right {
+		if x.ForUpdate {
+			return false
+		}
+	}
+	if t := s.tx; t != nil {
+		return t.iso != Serializable && len(t.writes) == 0 && len(t.serials) == 0 && len(t.readRows) == 0 && len(t.readTables) == 0
+	}
+	if s.nextIso >= 0 {
+		return s.nextIso != Serializable
+	}
+	return s.iso != Serializable
 }
 
 func (s *Session) show(name string) *Result {
@@ -897,8 +936,8 @@ func (s *Session) delete(st *sql.Delete) (*Result, error) {
 
 // Describe reports the result columns of a statement without running it.
 func (s *Session) Describe(st sql.Stmt) ([]string, []string, error) {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
 	var sel *sql.Select
 	var tb *Table
 	var items []sql.SelItem
@@ -991,8 +1030,8 @@ func (s *Session) describe(sel *sql.Select) ([]string, []string, error) {
 
 // ParamKinds guesses the kind of each $n parameter from the column it is compared with or stored in.
 func (s *Session) ParamKinds(st sql.Stmt, n int) []string {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
 	out := make([]string, n)
 	cols := map[string]string{}
 	addTable := func(name string) {

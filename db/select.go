@@ -53,8 +53,16 @@ func (s *Session) visibleRows(tb *Table) ([][]Value, []*Row, error) {
 	return rows, refs, err
 }
 
+// lookup finds one row by key. Outside SERIALIZABLE a row that is only in the page file is not
+// brought into memory, so reads stay side-effect free; writers own() it first.
 func (s *Session) lookup(tb *Table, k string) ([]Value, *Row, error) {
-	r := s.db.row(tb, k)
+	r := tb.rows[k]
+	if r == nil && s.tx.iso != Serializable {
+		r, _ = s.db.fromDisk(tb, k)
+		r.transient = true
+	} else if r == nil {
+		r = s.db.row(tb, k)
+	}
 	vals, err := s.db.read(s.tx, tb, r)
 	return vals, r, err
 }
