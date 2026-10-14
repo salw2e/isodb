@@ -143,3 +143,59 @@ func TestIndexReadsSerializable(t *testing.T) {
 		t.Fatalf("phantom through an index: %v, %v on shift 7", errs, res.Rows[0][0])
 	}
 }
+
+// Joins that look the joined table up through its primary key or an index must give what the same
+// join gives when it has to load both tables.
+func TestJoinLookupsMatchScan(t *testing.T) {
+	old := maxLog
+	maxLog = 4096
+	defer func() { maxLog = old }()
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.NewSession("t")
+	for _, q := range []string{
+		"CREATE TABLE c (id integer PRIMARY KEY, country integer)",
+		"CREATE TABLE o (id integer PRIMARY KEY, cid integer, amt integer)",
+		"CREATE INDEX o_cid ON o (cid)",
+	} {
+		if _, err := run(s, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rng := rand.New(rand.NewSource(3))
+	for i := 0; i < 300; i++ {
+		run(s, fmt.Sprintf("INSERT INTO c VALUES (%d, %d)", i, i%30))
+	}
+	for i := 0; i < 3000; i++ {
+		run(s, fmt.Sprintf("INSERT INTO o VALUES (%d, %d, %d)", i, rng.Intn(320), rng.Intn(200)))
+	}
+	pairs := [][2]string{
+		{"SELECT c.id, o.id FROM c JOIN o ON o.cid = c.id WHERE c.id = %d ORDER BY 1, 2",
+			"SELECT c.id, o.id FROM c JOIN o ON o.cid + 0 = c.id WHERE c.id + 0 = %d ORDER BY 1, 2"},
+		{"SELECT c.id, sum(o.amt) FROM c JOIN o ON o.cid = c.id WHERE c.country = %d GROUP BY c.id ORDER BY 1",
+			"SELECT c.id, sum(o.amt) FROM c JOIN o ON o.cid + 0 = c.id WHERE c.country = %d GROUP BY c.id ORDER BY 1"},
+		{"SELECT o.id, c.country FROM o, c WHERE c.id = o.cid AND o.amt = %d ORDER BY 1",
+			"SELECT o.id, c.country FROM o, c WHERE c.id + 0 = o.cid AND o.amt = %d ORDER BY 1"},
+	}
+	for round := 0; round < 4; round++ {
+		for _, p := range pairs {
+			for k := 0; k < 15; k++ {
+				v := rng.Intn(30)
+				got, err1 := run(s, fmt.Sprintf(p[0], v))
+				want, err2 := run(s, fmt.Sprintf(p[1], v))
+				if err1 != nil || err2 != nil {
+					t.Fatal(err1, err2)
+				}
+				if !reflect.DeepEqual(got.Rows, want.Rows) {
+					t.Fatalf("%s with %d: lookups gave %v, scan gave %v", p[0], v, got.Rows, want.Rows)
+				}
+			}
+		}
+		for i := 0; i < 200; i++ {
+			run(s, fmt.Sprintf("UPDATE o SET cid = %d WHERE id = %d", rng.Intn(320), rng.Intn(3000)))
+		}
+	}
+}
