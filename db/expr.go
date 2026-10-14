@@ -118,25 +118,33 @@ func (e *env) eval(x sql.Expr) (Value, error) {
 		v, err := e.eval(x.X)
 		return (v == nil) != x.Not, err
 	case *sql.Between:
-		v, err := e.eval(x.X)
-		if err != nil {
-			return nil, err
+		// x BETWEEN lo AND hi is x >= lo AND x <= hi, each folded to NULL by a NULL constant
+		var a, b Value
+		if !nullConst(x.X) && !nullConst(x.Lo) {
+			v, err := e.eval(x.X)
+			if err != nil {
+				return nil, err
+			}
+			lo, err := e.eval(x.Lo)
+			if err != nil {
+				return nil, err
+			}
+			if a, err = cmpOp(">=", v, lo); err != nil {
+				return nil, err
+			}
 		}
-		lo, err := e.eval(x.Lo)
-		if err != nil {
-			return nil, err
-		}
-		hi, err := e.eval(x.Hi)
-		if err != nil {
-			return nil, err
-		}
-		a, err := cmpOp(">=", v, lo)
-		if err != nil {
-			return nil, err
-		}
-		b, err := cmpOp("<=", v, hi)
-		if err != nil {
-			return nil, err
+		if a != false && !nullConst(x.X) && !nullConst(x.Hi) {
+			v, err := e.eval(x.X)
+			if err != nil {
+				return nil, err
+			}
+			hi, err := e.eval(x.Hi)
+			if err != nil {
+				return nil, err
+			}
+			if b, err = cmpOp("<=", v, hi); err != nil {
+				return nil, err
+			}
 		}
 		r := and3(a, b)
 		if x.Not {
@@ -330,6 +338,88 @@ func likeRegexp(p string, icase bool) (*regexp.Regexp, error) {
 	return re, nil
 }
 
+// nullConst reports an expression that is NULL whatever the row: Postgres folds a strict operator
+// with such an input to NULL before running the query, so its other input is never evaluated.
+func nullConst(x sql.Expr) bool {
+	switch y := x.(type) {
+	case *sql.Lit:
+		return y.V == nil
+	case *sql.Cast:
+		return nullConst(y.X)
+	case *sql.Unary:
+		return nullConst(y.X)
+	case *sql.Binary:
+		switch y.Op {
+		case "and", "or", "is distinct", "is not distinct":
+			return false
+		}
+		return nullConst(y.L) || nullConst(y.R)
+	case *sql.Case:
+		// CASE NULL WHEN ... compares NULL with every WHEN, so only ELSE can be the result
+		return y.Operand != nil && nullConst(y.Operand) && (y.Else == nil || nullConst(y.Else))
+	}
+	return false
+}
+
+// neverTrue reports a condition that is NULL or FALSE for every row; neverFalse one that is NULL or
+// TRUE. Postgres turns a WHERE or HAVING clause that can never be true into "no rows" at plan time,
+// so nothing in it is evaluated.
+func neverTrue(x sql.Expr) bool {
+	switch y := x.(type) {
+	case *sql.Lit:
+		return y.V == nil || y.V == false
+	case *sql.Unary:
+		if y.Op == "not" {
+			return neverFalse(y.X)
+		}
+	case *sql.Binary:
+		switch y.Op {
+		case "and":
+			return neverTrue(y.L) || neverTrue(y.R)
+		case "or":
+			return neverTrue(y.L) && neverTrue(y.R)
+		}
+	case *sql.Between:
+		if y.Not {
+			return neverFalse(&sql.Between{X: y.X, Lo: y.Lo, Hi: y.Hi})
+		}
+		return nullConst(y.X) || nullConst(y.Lo) || nullConst(y.Hi)
+	case *sql.In:
+		return nullConst(y.X)
+	case *sql.IsNull:
+		return y.Not && nullConst(y.X)
+	}
+	return nullConst(x)
+}
+
+func neverFalse(x sql.Expr) bool {
+	switch y := x.(type) {
+	case *sql.Lit:
+		return y.V == nil || y.V == true
+	case *sql.Unary:
+		if y.Op == "not" {
+			return neverTrue(y.X)
+		}
+	case *sql.Binary:
+		switch y.Op {
+		case "and":
+			return neverFalse(y.L) && neverFalse(y.R)
+		case "or":
+			return neverFalse(y.L) || neverFalse(y.R)
+		}
+	case *sql.Between:
+		if y.Not {
+			return neverTrue(&sql.Between{X: y.X, Lo: y.Lo, Hi: y.Hi})
+		}
+		return nullConst(y.X) || nullConst(y.Lo) && nullConst(y.Hi)
+	case *sql.In:
+		return nullConst(y.X)
+	case *sql.IsNull:
+		return !y.Not && nullConst(y.X)
+	}
+	return nullConst(x)
+}
+
 func not3(v Value) Value {
 	if v == nil {
 		return nil
@@ -415,6 +505,9 @@ func (e *env) binary(x *sql.Binary) (Value, error) {
 			return and3(av, bv), nil
 		}
 		return or3(av, bv), nil
+	}
+	if x.Op != "is distinct" && x.Op != "is not distinct" && (nullConst(x.L) || nullConst(x.R)) {
+		return nil, nil
 	}
 	a, err := e.eval(x.L)
 	if err != nil {

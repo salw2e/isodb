@@ -328,6 +328,10 @@ func (s *Session) core(sel *sql.Select, outer *env, order []sql.Order, final boo
 			hasLeft = true
 		}
 	}
+	// a HAVING clause without aggregates is part of WHERE for Postgres
+	if sel.Where != nil && neverTrue(sel.Where) || sel.Having != nil && !hasAggregate(sel.Having) && neverTrue(sel.Having) {
+		return s.project(sel, l, nil, outer, order, final)
+	}
 	e := &env{l: l, outer: outer, s: s, params: s.params}
 	cur := make([]Value, len(all))
 	curRefs := make([]*Row, n)
@@ -734,6 +738,9 @@ func (s *Session) project(sel *sql.Select, l *layout, rows [][]Value, outer *env
 		if len(sel.GroupBy) == 0 && len(rows) == 0 {
 			order2 = append(order2, "")
 			groups[""] = [][]Value{}
+		}
+		if sel.Having != nil && neverTrue(sel.Having) {
+			order2 = nil
 		}
 		for _, k := range order2 {
 			g := groups[k]
