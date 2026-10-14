@@ -468,6 +468,47 @@ func (p *pager) seekIn(id pageID, k []byte, fn func(k, v []byte) bool) (bool, er
 	return true, nil
 }
 
+// seekRev calls fn for every key below k (every key when k is nil), in descending order, until it
+// returns false.
+func (p *pager) seekRev(root pageID, k []byte, fn func(k, v []byte) bool) error {
+	if root == 0 {
+		return nil
+	}
+	_, err := p.seekRevIn(root, k, fn)
+	return err
+}
+
+func (p *pager) seekRevIn(id pageID, k []byte, fn func(k, v []byte) bool) (bool, error) {
+	n, err := p.load(id)
+	if err != nil {
+		return false, err
+	}
+	if n.leaf {
+		keys, vals := n.keys, n.vals
+		i := len(keys)
+		if k != nil {
+			i = sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], k) >= 0 })
+		}
+		for i--; i >= 0; i-- {
+			if !fn(keys[i], vals[i]) {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	kids := append([]pageID(nil), n.kids...)
+	i := len(kids) - 1
+	if k != nil {
+		i = search(n, k)
+	}
+	for ; i >= 0; i-- {
+		if ok, err := p.seekRevIn(kids[i], k, fn); err != nil || !ok {
+			return ok, err
+		}
+	}
+	return true, nil
+}
+
 type piece struct {
 	sep []byte
 	id  pageID
