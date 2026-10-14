@@ -64,6 +64,7 @@ func (db *DB) row(tb *Table, k string) *Row {
 	r, _ := db.fromDisk(tb, k)
 	tb.rows[k] = r
 	tb.order = append(tb.order, r)
+	db.reindex(r)
 	return r
 }
 
@@ -112,6 +113,7 @@ func (db *DB) trim(r *Row) {
 	}
 	if len(r.vers) == 0 && r.disk == nil || len(r.vers) == 1 && r.vers[0] == r.disk {
 		delete(r.tb.rows, r.key)
+		db.reindex(r)
 	}
 }
 
@@ -140,6 +142,8 @@ func (db *DB) openPages(dir string) error {
 	if ok {
 		s := db.NewSession("recovery")
 		r := &reader{b: v}
+		db.opening = true
+		defer func() { db.opening = false }()
 		for len(r.b) > 0 && !r.err {
 			text := r.str()
 			stmts, texts, _, err := sql.Parse(text)
@@ -153,15 +157,31 @@ func (db *DB) openPages(dir string) error {
 			}
 		}
 	}
+	roots := map[string]pageID{}
 	err = pg.scan(cat, func(k, v []byte) bool {
 		if tb := db.tables[string(k)]; tb != nil && len(v) == 16 {
 			tb.root = pageID(binary.LittleEndian.Uint64(v))
 			tb.nextID = int64(binary.LittleEndian.Uint64(v[8:]))
+		} else if len(v) == 8 {
+			roots[string(k)] = pageID(binary.LittleEndian.Uint64(v))
 		}
 		return true
 	})
+	if err != nil {
+		return err
+	}
 	db.ts = int64(pg.m.ts)
-	return err
+	// an index the last checkpoint has no tree for (made by an older version) is built now
+	for _, tb := range db.tables {
+		for _, ix := range tb.indexes {
+			if root, ok := roots[indexEntry(tb, ix)]; ok {
+				ix.root = root
+			} else if err := db.build(tb, ix); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // freeTree gives back every page of a dropped table's tree.
@@ -194,6 +214,9 @@ func (p *pager) freeTree(id pageID) error {
 func (db *DB) flush() error {
 	pg := db.pg
 	for _, root := range db.dropped {
+		if root == 0 {
+			continue
+		}
 		if err := pg.freeTree(root); err != nil {
 			return err
 		}
@@ -214,6 +237,9 @@ func (db *DB) flush() error {
 			}
 			v := latestCommitted(r)
 			if v != nil && v != r.disk {
+				if err := db.flushIndexes(tb, r, v); err != nil {
+					return err
+				}
 				var err error
 				if v.dead {
 					tb.root, err = pg.del(tb.root, []byte(r.key))
@@ -227,6 +253,7 @@ func (db *DB) flush() error {
 			}
 			if db.settled(r, h) {
 				delete(tb.rows, r.key)
+				db.reindex(r)
 				continue
 			}
 			keep = append(keep, r)
@@ -234,10 +261,19 @@ func (db *DB) flush() error {
 		tb.order = keep
 	}
 
+	want := map[string][]byte{}
+	for _, n := range names {
+		tb := db.tables[n]
+		v := binary.LittleEndian.AppendUint64(nil, uint64(tb.root))
+		want[n] = binary.LittleEndian.AppendUint64(v, uint64(tb.nextID))
+		for _, ix := range tb.indexes {
+			want[indexEntry(tb, ix)] = binary.LittleEndian.AppendUint64(nil, uint64(ix.root))
+		}
+	}
 	cat := pageID(pg.m.catalog)
 	var stale [][]byte
 	if err := pg.scan(cat, func(k, v []byte) bool {
-		if string(k) != ddlKey && db.tables[string(k)] == nil {
+		if string(k) != ddlKey && want[string(k)] == nil {
 			stale = append(stale, append([]byte(nil), k...))
 		}
 		return true
@@ -250,11 +286,8 @@ func (db *DB) flush() error {
 			return err
 		}
 	}
-	for _, n := range names {
-		tb := db.tables[n]
-		v := binary.LittleEndian.AppendUint64(nil, uint64(tb.root))
-		v = binary.LittleEndian.AppendUint64(v, uint64(tb.nextID))
-		if cat, err = pg.put(cat, []byte(n), v); err != nil {
+	for _, n := range sortedKeys(want) {
+		if cat, err = pg.put(cat, []byte(n), want[n]); err != nil {
 			return err
 		}
 	}
@@ -286,4 +319,48 @@ func (db *DB) settled(r *Row, h int64) bool {
 	}
 	newest := r.vers[len(r.vers)-1]
 	return newest == r.disk && newest.tx.commit <= h
+}
+
+func indexEntry(tb *Table, ix *Index) string {
+	return "\x00i" + tb.Name + "\x00" + ix.Name
+}
+
+func sortedKeys(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// flushIndexes moves r's index entries in the page file from the values it holds there to v's.
+func (db *DB) flushIndexes(tb *Table, r *Row, v *Version) error {
+	for _, ix := range tb.indexes {
+		var old, now string
+		var oldOK, nowOK bool
+		if r.disk != nil && !r.disk.dead {
+			k, null := ix.key(r.disk.vals)
+			old, oldOK = k+r.key, !null
+		}
+		if !v.dead {
+			k, null := ix.key(v.vals)
+			now, nowOK = k+r.key, !null
+		}
+		if oldOK == nowOK && old == now {
+			continue
+		}
+		var err error
+		if oldOK {
+			if ix.root, err = db.pg.del(ix.root, []byte(old)); err != nil {
+				return err
+			}
+		}
+		if nowOK {
+			if ix.root, err = db.pg.put(ix.root, []byte(now), nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

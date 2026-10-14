@@ -339,7 +339,7 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 				tb.PK = append(tb.PK, i)
 			}
 			if c.Unique {
-				tb.Uniques = append(tb.Uniques, []int{i})
+				tb.indexes = append(tb.indexes, &Index{Name: st.Name + "_" + c.Name + "_key", Cols: []int{i}, Unique: true, mem: map[string]map[*Row]bool{}})
 			}
 		}
 		for _, n := range st.PK {
@@ -361,8 +361,10 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 				}
 				return nil, errf(codeUndefTable, "table \"%s\" does not exist", n)
 			}
-			if tb := db.tables[n]; tb.root != 0 {
-				db.dropped = append(db.dropped, tb.root)
+			tb := db.tables[n]
+			db.dropped = append(db.dropped, tb.root)
+			for _, ix := range tb.indexes {
+				db.dropped = append(db.dropped, ix.root)
 			}
 			delete(db.tables, n)
 			for i, t := range db.indexes {
@@ -393,31 +395,43 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 			}
 			cols = append(cols, i)
 		}
-		if st.Unique {
+		if st.Name == "" {
+			st.Name = st.Table + "_" + strings.Join(st.Cols, "_") + "_idx"
+			txt = "CREATE " + map[bool]string{true: "UNIQUE ", false: ""}[st.Unique] + "INDEX " + st.Name + " ON " + st.Table + " (" + strings.Join(st.Cols, ", ") + ")"
+		}
+		ix := &Index{Name: st.Name, Cols: cols, Unique: st.Unique}
+		if !db.opening {
 			seen := map[string]bool{}
 			err := db.each(tb, func(r *Row) error {
 				v := latestCommitted(r)
 				if v == nil || v.dead {
 					return nil
 				}
-				k, null := uniqueKey(v.vals, cols)
+				k, null := ix.key(v.vals)
 				if null {
 					return nil
 				}
-				if seen[k] {
+				if db.pg != nil && len(k)+len(r.key) > maxKey {
+					return errf("54000", "index row size %d exceeds maximum %d for index \"%s\"", len(k)+len(r.key), maxKey, st.Name)
+				}
+				if st.Unique && seen[k] {
 					return errf(codeUnique, "could not create unique index \"%s\"", st.Name)
 				}
-				seen[k] = true
+				if st.Unique {
+					seen[k] = true
+				}
 				return nil
 			})
 			if err != nil {
 				return nil, err
 			}
-			tb.Uniques = append(tb.Uniques, cols)
 		}
-		if st.Name == "" {
-			st.Name = st.Table + "_" + strings.Join(st.Cols, "_") + "_idx"
-			txt = "CREATE " + map[bool]string{true: "UNIQUE ", false: ""}[st.Unique] + "INDEX " + st.Name + " ON " + st.Table + " (" + strings.Join(st.Cols, ", ") + ")"
+		ix.mem = map[string]map[*Row]bool{}
+		tb.indexes = append(tb.indexes, ix)
+		if !db.opening {
+			if err := db.build(tb, ix); err != nil {
+				return nil, err
+			}
 		}
 		db.indexes[st.Name] = st.Table
 		db.indexText[st.Name] = txt
@@ -450,6 +464,18 @@ func (s *Session) ddl(st sql.Stmt, txt string) (*Result, error) {
 	case *sql.DropIndex:
 		if db.indexes[st.Name] == "" && !st.IfExists {
 			return nil, errf(codeUndefTable, "index \"%s\" does not exist", st.Name)
+		}
+		if tb := db.tables[db.indexes[st.Name]]; tb != nil {
+			for i, ix := range tb.indexes {
+				if ix.Name == st.Name {
+					db.dropped = append(db.dropped, ix.root)
+					tb.indexes = append(tb.indexes[:i:i], tb.indexes[i+1:]...)
+					for _, r := range tb.order {
+						db.reindex(r)
+					}
+					break
+				}
+			}
 		}
 		delete(db.indexes, st.Name)
 		delete(db.indexText, st.Name)
@@ -510,16 +536,27 @@ func (tb *Table) keyOf(vals []Value) string {
 	return key(k)
 }
 
-// checkUnique looks for another live row with the same values in a unique column set.
+// checkUnique looks for another live row with the same values in a unique index, waiting for
+// a transaction that is still writing one. Every index entry must also fit in a page.
 func (s *Session) checkUnique(tb *Table, self *Row, vals []Value) error {
-	for _, cols := range tb.Uniques {
-		k, null := uniqueKey(vals, cols)
+	for _, ix := range tb.indexes {
+		k, null := ix.key(vals)
 		if null {
 			continue
 		}
-		err := s.db.each(tb, func(r *Row) error {
-			if r == self || r.key == self.key {
-				return nil
+		if s.db.pg != nil && len(k)+len(self.key) > maxKey {
+			return errf("54000", "index row size %d exceeds maximum %d for index \"%s\"", len(k)+len(self.key), maxKey, ix.Name)
+		}
+		if !ix.Unique {
+			continue
+		}
+		rs, err := s.db.candidates(tb, ix, k)
+		if err != nil {
+			return err
+		}
+		for _, r := range rs {
+			if r == self || r.key == self.key || len(r.vers) == 0 {
+				continue
 			}
 			v := r.vers[len(r.vers)-1]
 			if v.tx != s.tx && v.tx.state != committed {
@@ -529,19 +566,15 @@ func (s *Session) checkUnique(tb *Table, self *Row, vals []Value) error {
 					}
 				}
 				if v = latest(s.tx, r); v == nil {
-					return nil
+					continue
 				}
 			}
 			if v.dead {
-				return nil
+				continue
 			}
-			if k2, _ := uniqueKey(v.vals, cols); k2 == k {
-				return errf(codeUnique, "duplicate key value violates unique constraint on %s", tb.Name)
+			if k2, _ := ix.key(v.vals); k2 == k {
+				return errf(codeUnique, "duplicate key value violates unique constraint \"%s\"", ix.Name)
 			}
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 	}
 	return nil
@@ -794,6 +827,43 @@ func (s *Session) matching(tb *Table, alias string, where sql.Expr) ([]match, *e
 			if done {
 				break
 			}
+		}
+	}
+	if !done {
+		ix, xs := pickIndex(tb, func(name string) sql.Expr {
+			for _, c := range splitAnd(where, nil) {
+				b, ok := c.(*sql.Binary)
+				if !ok || b.Op != "=" {
+					continue
+				}
+				for _, side := range [][2]sql.Expr{{b.L, b.R}, {b.R, b.L}} {
+					col, ok := side[0].(*sql.Col)
+					if !ok || col.Name != name || col.Table != "" && col.Table != alias {
+						continue
+					}
+					if refs, _ := refsOf(side[1], l, []int{0}); len(refs) > 0 || hasSubquery(side[1]) {
+						continue
+					}
+					return side[1]
+				}
+			}
+			return nil
+		})
+		if ix != nil {
+			k, ok, err := lookupKey(tb, ix, xs, e)
+			if err != nil {
+				return nil, nil, err
+			}
+			if ok {
+				rows, refs, err := s.indexed(tb, ix, k)
+				if err != nil {
+					return nil, nil, err
+				}
+				for i := range rows {
+					cands = append(cands, match{refs[i], rows[i]})
+				}
+			}
+			done = true
 		}
 	}
 	var out []match
